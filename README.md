@@ -36,7 +36,7 @@ Press `?` inside for this list.
 | | `C-e` `C-y` | scroll one line, keeping the selection on screen |
 | | `H` `M` `L` | top / middle / bottom of the screen |
 | | `zz` `zt` `zb` | scroll the selected item to the middle / top / bottom |
-| **Open** | `l` / Enter | open the thread (side by side when the terminal is 140+ columns wide) |
+| **Open** | `l` / Enter | open the thread (side by side when the terminal is 140+ columns wide). Opening a chat marks its other notifications read, since you can see the whole chat; `u` brings them back. |
 | | `h` / Esc | back to the list |
 | | `J` `K` | next / previous notification, also from inside a thread |
 | **Triage** | `e` or `dd` | mark read and move on (takes a count, or a `V` range) |

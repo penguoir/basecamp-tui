@@ -39,7 +39,8 @@ HELP = """\
              C-d/C-u   half page          C-f/C-b     full page
              C-e/C-y   scroll one line    zz/zt/zb    current item to middle/top/bottom
              H/M/L     screen top/mid/bot {count}j    e.g. 5j
- OPEN        l / ⏎     open thread        h / Esc     back to list
+ OPEN        l / ⏎     open thread (opening a chat marks its other notifications read)
+             h / Esc   back to list
              J / K     next/prev item (works from the thread too)
  TRIAGE      e or dd   mark read (+advance); count/visual-range aware
              V         visual line mode (then e/d marks the range)
@@ -941,6 +942,25 @@ class App:
         t = parse_target(n)
         if t and t["kind"] == "chats":
             self.pscroll = max(len(lines) - (self.body_h() - 1), 0)
+            self.mark_chat_read(n, t)
+
+    def mark_chat_read(self, n, t):
+        """An open chat shows all of it, so its other notifications are read too.
+
+        The open one stays put (so the preview doesn't jump) and e clears it as usual.
+        """
+        same = [m for m in self.items if m is not n and unread(m) and not is_note(m)
+                and (parse_target(m) or {}).get("kind") == "chats"
+                and (parse_target(m)["bucket"], parse_target(m)["id"]) == (t["bucket"], t["id"])]
+        if not same:
+            return
+        self.undo.append({"batch": [(self.items.index(m), m) for m in same], "busy": False, "revert": None})
+        now = datetime.now(timezone.utc).isoformat()
+        for m in same:
+            m["read_at"] = now
+        self.bg(lambda sgids, _batch: mark_read(sgids), [m["readable_sgid"] for m in same], same, tag="markread")
+        self.cur = self.index_of(n["id"])
+        self.flash(f"also marked {len(same)} more from {n.get('bucket_name', 'this chat')} read · u to undo")
 
     def open_browser(self):
         n = self.selected()

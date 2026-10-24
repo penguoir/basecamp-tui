@@ -806,6 +806,84 @@ class TestMarkReadAndUndo(Base):
         self.assertIn("undo failed on server", app.status)
 
 
+class TestChatSeen(Base):
+    """Opening a chat shows all of it, so its other notifications count as read."""
+
+    def setUp(self):
+        super().setUp()
+        self.fake.routes[("api", "get")] = [{"id": 1, "creator": {"name": "Bot"}, "content": "deploy slow"}]
+        self.fake.routes[("show",)] = {"title": "x"}
+
+    def items(self):
+        return [notif(1, "chats/5@11", bucket_name="Monitoring"), notif(2, "messages/3"),
+                notif(3, "chats/5@12", bucket_name="Monitoring"), notif(4, "chats/6@13", bucket_name="Other"),
+                notif(5, "chats/5@14", bucket_name="Monitoring", read=True), notif(6, "chats/5@15", bucket=99),
+                notif(7, "chats/5@16", bucket_name="Monitoring")]
+
+    def test_opening_a_chat_marks_its_other_notifications_read(self):
+        app = self.app(self.items())
+        app.goto(1)
+        app.key("j")  # the second Monitoring ping
+        app.key("l")
+        app.drain()
+        self.assertEqual([n["id"] for n in app.view()], [2, 3, 4, 6])
+        self.assertEqual(app.selected()["id"], 3)
+        puts = self.fake.called("api", "put", "/my/unreads.json")
+        self.assertEqual(json.loads(puts[0][4]), {"readables": ["sg1", "sg7"]})
+        self.assertEqual(app.status, "also marked 2 more from Monitoring read · u to undo")
+        app.key("u")
+        self.assertEqual([n["id"] for n in app.view()], [1, 2, 3, 4, 6, 7])
+
+    def test_marks_once_the_chat_has_loaded(self):
+        app = self.app(self.items())
+        app.inflight.add(1)  # thread still loading: nothing marked yet
+        app.key("l")
+        self.assertEqual(self.fake.called("api", "put"), [])
+        app.inflight.discard(1)
+        app.results.put(("thread", (app.selected(),), [("body", "x")], None))
+        app.drain()
+        self.assertEqual(len(self.fake.called("api", "put")), 1)
+        self.assertEqual(app.selected()["id"], 1)
+
+    def test_failed_load_marks_nothing(self):
+        self.fake.routes[("api", "get")] = bt.BCError("down")
+        app = self.app(self.items())
+        app.key("l")
+        app.drain()
+        self.assertEqual(self.fake.called("api", "put"), [])
+
+    def test_moving_onto_a_chat_inside_the_preview(self):
+        app = self.app(self.items())
+        app.goto(1)
+        app.key("l")
+        self.assertEqual(self.fake.called("api", "put"), [])
+        app.key("J")
+        app.prefetch()  # the run loop loads the chat; marking waits for it
+        app.drain()
+        self.assertEqual([n["id"] for n in app.view()], [2, 3, 4, 6])
+
+    def test_just_selecting_in_split_view_marks_nothing(self):
+        app = self.app(self.items(), w=150)
+        app.draw()
+        app.key("j")
+        app.drain()
+        app.draw()
+        self.assertEqual(self.fake.called("api", "put"), [])
+
+    def test_lone_chat_ping_and_server_failure(self):
+        app = self.app([notif(1, "chats/5@11"), notif(2, "chats/6@1")])
+        app.key("l")
+        app.drain()
+        self.assertEqual((app.undo, self.fake.called("api", "put")), ([], []))
+        app = self.app(self.items())
+        self.fake.routes[("api", "put", "/my/unreads.json")] = bt.BCError("500")
+        app.key("l")
+        app.drain()
+        self.assertEqual(len(app.view()), 6)
+        self.assertEqual(app.undo, [])
+        self.assertIn("mark read failed, restored", app.status)
+
+
 class TestItemActions(Base):
     def setUp(self):
         super().setUp()
