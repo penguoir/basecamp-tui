@@ -29,10 +29,13 @@ Press `?` inside for this list.
 
 | | Key | Does |
 |---|---|---|
-| **Move** | `j` `k` / arrows | next / previous |
-| | `gg` `G`, `{count}j` | top, bottom, jump by count |
+| **Move** | `j` `k` / arrows, `C-n` `C-p` | next / previous |
+| | `gg` `G`, Home End | top, bottom (`{count}gg` / `{count}G` jump to that item) |
+| | `{count}j` | jump by count |
 | | `C-d` `C-u` `C-f` `C-b` | half / full page |
+| | `C-e` `C-y` | scroll one line, keeping the selection on screen |
 | | `H` `M` `L` | top / middle / bottom of the screen |
+| | `zz` `zt` `zb` | scroll the selected item to the middle / top / bottom |
 | **Open** | `l` / Enter | open the thread (side by side when the terminal is 140+ columns wide) |
 | | `h` / Esc | back to the list |
 | | `J` `K` | next / previous notification, also from inside a thread |
@@ -47,7 +50,12 @@ Press `?` inside for this list.
 | | `o` / `y` | open in browser / copy the link (OSC 52, works over SSH) |
 | **View** | Tab | unread only / everything |
 | | `/` `N` | search (an empty `/` jumps to the next match), previous |
-| | `R`, `:q` / `q` | refresh, quit |
+| | `R`, `C-l` | refresh, redraw the screen |
+| | `:q` / `q` / `ZZ` / `ZQ` | quit |
+
+Ctrl keys also work in terminals that send them as escape sequences (the kitty keyboard
+protocol or xterm's modifyOtherKeys, as in ghostty, kitty, foot, WezTerm and tmux with
+`extended-keys`).
 
 ### @mentions
 
@@ -71,6 +79,15 @@ your phone too. Clearing one with `e`/`D` removes it from the pad; `u` brings it
 | `BASECAMP_BIN` | `basecamp` | path to the Basecamp CLI |
 | `CLAUDE_BIN` | `claude` | path to Claude Code |
 | `VISUAL` / `EDITOR` | `vim` | editor for replies (vi, vim and nvim start in insert mode) |
+
+## Tests
+
+```sh
+python3 -m unittest discover -s tests
+```
+
+Standard library only. The `basecamp` CLI, curses and the editor are faked, so the tests never
+touch your account. For coverage: `coverage run --include=basecamp-tui -m unittest discover -s tests && coverage report`.
 
 ## License
 

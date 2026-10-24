@@ -34,8 +34,10 @@ PREFETCH = 3
 HELP = """\
  basecamp-tui — vim-style Basecamp inbox
 
- MOVE        j/k ↓/↑   next/prev          gg / G      top / bottom
+ MOVE        j/k ↓/↑   next/prev          gg / G      top / bottom ({count}gg, {count}G)
+             C-n/C-p   next/prev          Home/End    top / bottom
              C-d/C-u   half page          C-f/C-b     full page
+             C-e/C-y   scroll one line    zz/zt/zb    current item to middle/top/bottom
              H/M/L     screen top/mid/bot {count}j    e.g. 5j
  OPEN        l / ⏎     open thread        h / Esc     back to list
              J / K     next/prev item (works from the thread too)
@@ -50,7 +52,8 @@ HELP = """\
              o         open in browser       y           yank URL (OSC 52)
              c / C     message a new background Claude session about this item
  VIEW        Tab       toggle unread / all   /  N        search (empty / = next), prev
-             R         refresh               :q  q       quit
+             R         refresh               C-l         redraw
+             :q  q     quit                  ZZ  ZQ      quit
              ?         this help (any key closes)
 """
 
@@ -135,7 +138,7 @@ _projects = {}
 def resolve_checkin(n):
     """Check-in reminders link to an answer form with no project in the URL; find the
     question by project name + question text and pin it on the notification."""
-    if not _projects:
+    if n.get("bucket_name") not in _projects:  # also picks up projects made since startup
         _projects.update({p["name"]: p["id"] for p in bc("projects", "list", "--all") or []})
     bucket = _projects.get(n.get("bucket_name"))
     if not bucket:
@@ -329,7 +332,7 @@ def edit_notes(change):
     notes = change(note_texts(content))
     block = ""
     if notes:
-        items = "".join(f"<li>{html.escape(t).replace(chr(10), '<br>')}</li>" for t in notes)
+        items = "".join(note_li(t) for t in notes)
         block = f'<p dir="auto">{NOTES_HEADING}</p><ul dir="auto">{items}</ul>'
     if _NOTES_BLOCK.search(content):
         content = _NOTES_BLOCK.sub(lambda _: block, content, count=1)
@@ -338,10 +341,19 @@ def edit_notes(change):
     bc("api", "put", "/my/notes.json", "-d", json.dumps({"content": content}))
 
 
+def note_li(text):
+    return f"<li>{html.escape(text).replace(chr(10), '<br>')}</li>"
+
+
 def remove_note(text):
+    # the pad drops trailing spaces and extra blank lines, so match the note as it reads back
+    stored = note_texts(f"<p>{NOTES_HEADING}</p><ul>{note_li(text)}</ul>")[0]
+
     def change(notes):
-        if text in notes:
-            notes.remove(text)
+        for t in (text, stored):
+            if t in notes:
+                notes.remove(t)
+                break
         return notes
     edit_notes(change)
 
@@ -513,6 +525,7 @@ def clip(s, width):
 
 
 def wrap(text, width):
+    width = max(width, 1)
     text = text.translate(_INVISIBLE)
     lines = []
     for para in text.split("\n"):
@@ -529,6 +542,7 @@ def wrap(text, width):
                     continue
             while ww > width:  # hard-break very long words / URLs
                 head, hw = clip(word, width)
+                head = head or word[0]  # nothing fits (tiny pane): one char per line
                 lines.append(head)
                 word = word[len(head):]
                 ww = swidth(word)
@@ -545,6 +559,8 @@ def age(ts):
         t = datetime.fromisoformat(ts.replace("Z", "+00:00"))
     except ValueError:
         return ""
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=timezone.utc)
     s = (datetime.now(timezone.utc) - t).total_seconds()
     if s < 3600:
         return f"{max(int(s // 60), 0)}m"
@@ -553,6 +569,48 @@ def age(ts):
     if s < 86400 * 14:
         return f"{int(s // 86400)}d"
     return t.strftime("%d %b")
+
+
+# Terminals speaking the kitty keyboard protocol or xterm modifyOtherKeys (ghostty, kitty,
+# foot, WezTerm, tmux with extended-keys) send C-u as ESC[117;5u rather than ^U; read raw,
+# that's Esc, a count of 1175 and u (undo). curses passes on sequences it doesn't know.
+ALT_ENTER = "alt-enter"
+_CSI_LETTER = {"A": curses.KEY_UP, "B": curses.KEY_DOWN, "C": curses.KEY_RIGHT, "D": curses.KEY_LEFT,
+               "H": curses.KEY_HOME, "F": curses.KEY_END}
+_CSI_TILDE = {"1": curses.KEY_HOME, "7": curses.KEY_HOME, "4": curses.KEY_END, "8": curses.KEY_END,
+              "5": curses.KEY_PPAGE, "6": curses.KEY_NPAGE, "3": curses.KEY_DC}
+_CODEPOINT_KEYS = {13: "\r", 9: "\t", 127: "\x7f", 27: "\x1b", 8: "\x7f"}
+
+
+def decode_escape(seq):
+    """The key an escape sequence (what followed ESC) stands for: "\x1b" for a lone Esc,
+    ALT_ENTER for M-⏎, None for anything we don't use."""
+    if not seq:
+        return "\x1b"
+    if seq in ("\r", "\n"):
+        return ALT_ENTER
+    m = re.fullmatch(r"\[(\d+)[:\d]*(?:;(\d+)[:\d]*)?(?:;[\d:]*)?u", seq)  # kitty: CSI code;mods u
+    if m:
+        code, mods = int(m.group(1)), int(m.group(2) or 1)
+    else:
+        m = re.fullmatch(r"\[27;(\d+);(\d+)~", seq)  # xterm modifyOtherKeys: CSI 27;mods;code ~
+        if m:
+            mods, code = int(m.group(1)), int(m.group(2))
+    if m:
+        shift, alt, ctrl = ((mods - 1) >> b & 1 for b in (0, 1, 2))
+        ch = chr(code)
+        if code == 13 and (alt or shift):
+            return ALT_ENTER
+        if ctrl and not alt and ch.isascii() and ch.isalpha():
+            return chr(ord(ch.lower()) & 0x1F)
+        if ctrl or alt:
+            return None
+        return _CODEPOINT_KEYS.get(code, ch.upper() if shift else ch)
+    m = re.fullmatch(r"[\[O](?:1;\d+)?([A-DHF])", seq)
+    if m:
+        return _CSI_LETTER[m.group(1)]
+    m = re.fullmatch(r"\[(\d+)(?:;\d+)?~", seq)
+    return _CSI_TILDE.get(m.group(1)) if m else None
 
 
 def unread(n):
@@ -579,7 +637,8 @@ class App:
         self.pscroll = 0
         self.visual = None       # anchor index when in V mode
         self.count = ""
-        self.pending = ""        # first key of gg / dd
+        self.pending = ""        # first key of gg / dd / zz / ZZ
+        self.pending_count = (1, False)
         self.search = ""
         self.status = ""
         self.status_t = 0
@@ -678,7 +737,7 @@ class App:
                     batch = args[1]
                     for n in batch:
                         n["read_at"] = None
-                    self.undo = [u for u in self.undo if u["batch"][0][1] is not batch[0]]
+                    self.undo = [u for u in self.undo if not any(m is batch[0] for _, m in u["batch"])]
                     self.flash(f"mark read failed, restored: {err}")
             elif tag == "unread":
                 if err:
@@ -815,7 +874,8 @@ class App:
                 self.bg(mark_unread, n, tag="unread")
         if entry["revert"]:
             self.bg(entry["revert"], tag="revert")
-        self.cur = self.index_of(batch[0][1]["id"])
+        if batch:
+            self.cur = self.index_of(batch[0][1]["id"])
         self.flash(f"restored {len(batch)} to unread" + (" and reverted the change" if entry["revert"] else ""))
 
     def do_item_action(self, action):
@@ -922,6 +982,7 @@ class App:
         if not t:
             self.flash("can't reply to this one")
             return
+        answering = bool(t.get("checkin")) or t["kind"] == "questions"
         text, notes = "", ()
         while True:
             text = self.compose(text, notes)
@@ -929,7 +990,7 @@ class App:
                 self.flash("nothing written, reply not sent")
                 return
             try:
-                resolved, problems = resolve_mentions(text, raw_tag=bool(t.get("checkin")))
+                resolved, problems = resolve_mentions(text, raw_tag=answering)
             except BCError as e:
                 self.flash(f"couldn't load people for @mentions, not sent: {e}")
                 return
@@ -937,7 +998,7 @@ class App:
                 text = resolved
                 break
             notes = [*problems, "fix the @names below and :wq to send, or :q! to drop the reply"]
-        if t.get("checkin"):
+        if answering:
             args = ("checkins", "answer", "create", t["id"], text, "--in", t["bucket"])
         elif t["kind"] == "chats":
             args = ("chat", "post", text, "--in", t["bucket"], "--room", t["id"])
@@ -956,9 +1017,9 @@ class App:
         dict_path = None
         if is_vim:
             try:
+                words = "".join("@" + p["name"].replace(" ", ".") + "\n" for p in people())
                 with tempfile.NamedTemporaryFile("w", suffix=".dict", prefix="basecamp-tui-", delete=False) as d:
-                    for p in people():
-                        d.write("@" + p["name"].replace(" ", ".") + "\n")
+                    d.write(words)
                     dict_path = d.name
             except BCError:
                 pass
@@ -1036,15 +1097,17 @@ class App:
                 ch = self.scr.get_wch()
                 if ch == "\x1b":
                     seq = self.read_escape()
-                    if seq == "[200~":
-                        pasting = True
-                    elif seq == "[201~":
-                        pasting = False
-                    elif seq in ("\r", "\n"):  # M-⏎
+                    if seq in ("[200~", "[201~"):
+                        pasting = seq == "[200~"
+                        continue
+                    ch = decode_escape(seq)
+                    if ch == ALT_ENTER:
                         buf += "\n"
-                    elif not seq and not pasting:
+                        continue
+                    if ch == "\x1b" and not pasting:
                         return None
-                    continue
+                    if ch is None or ch == "\x1b":
+                        continue
                 if ch in ("\n", "\r", curses.KEY_ENTER):
                     if not pasting:
                         return buf
@@ -1120,6 +1183,8 @@ class App:
         had_count = bool(self.count)
         self.count = ""
         pend, self.pending = self.pending, ""
+        if pend:  # 3gg / 3dd: the count was typed before the first key
+            n, had_count = self.pending_count
         h = self.body_h()
         pv = self.focus == "preview"
 
@@ -1134,12 +1199,20 @@ class App:
             if ch == "d":
                 self.do_mark_read(n)
             return True
+        if pend == "z":
+            if not pv and ch in ("z", "t", "b", "."):
+                off = {"z": h // 2, ".": h // 2, "t": 0, "b": h - 1}[ch]
+                self.top = max(self.cur - off, 0)
+            return True
+        if pend == "Z":
+            return ch not in ("Z", "Q")
 
-        if ch in ("g", "d"):
+        if ch in ("g", "d", "z", "Z"):
             if ch == "d" and self.visual is not None:
                 self.do_mark_read()
             else:
                 self.pending = ch
+                self.pending_count = (n, had_count)
         elif ch == "q":
             if pv:
                 self.focus = "list"
@@ -1152,12 +1225,21 @@ class App:
             self.focus = "list"
         elif ch == "?":
             self.help = True
-        elif ch in ("j", curses.KEY_DOWN):
+        elif ch in ("\x05", "\x19"):  # C-e / C-y: scroll a line, the selection stays on screen
+            sign = 1 if ch == "\x05" else -1
+            if pv:
+                self.pscroll = max(self.pscroll + sign * n, 0)
+            elif self.view():
+                self.top = max(0, min(self.top + sign * n, len(self.view()) - 1))
+                self.goto(max(self.top, min(self.cur, self.top + h - 1)))
+        elif ch == "\x0c":  # C-l
+            self.scr.clear()
+        elif ch in ("j", curses.KEY_DOWN, "\x0e"):
             if pv:
                 self.pscroll += n
             else:
                 self.move(n)
-        elif ch in ("k", curses.KEY_UP):
+        elif ch in ("k", curses.KEY_UP, "\x10"):
             if pv:
                 self.pscroll = max(self.pscroll - n, 0)
             else:
@@ -1173,7 +1255,12 @@ class App:
                 self.pscroll = max(self.pscroll + sign * step, 0)
             else:
                 self.move(sign * step)
-        elif ch == "G":
+        elif ch == curses.KEY_HOME:
+            if pv:
+                self.pscroll = 0
+            else:
+                self.goto(0)
+        elif ch in ("G", curses.KEY_END):
             if pv:
                 self.pscroll = 10 ** 6
             else:
@@ -1383,6 +1470,11 @@ class App:
                 continue
             if ch == curses.KEY_RESIZE:
                 continue
+            if ch == "\x1b":
+                ch = decode_escape(self.read_escape())
+                self.scr.timeout(100)
+                if ch is None:
+                    continue
             if not self.key(ch):
                 return
 
