@@ -13,7 +13,6 @@ import os
 import queue
 import re
 import shutil
-import signal
 import subprocess
 import sys
 import tempfile
@@ -44,7 +43,7 @@ HELP = """\
              r         reply in vim (insert mode; :wq sends, :q! cancels) · answers check-ins
                        @jane / @Jane.Smith become real mentions (C-n completes names)
              o         open in browser       y           yank URL (OSC 52)
-             c / C     message a new Claude session about this item and attach to it
+             c / C     message a new background Claude session about this item
  VIEW        Tab       toggle unread / all   /  n  N     search, next, prev
              R         refresh               :q  q       quit
              ?         this help (any key closes)
@@ -242,38 +241,16 @@ def resolve_mentions(text, raw_tag=False):
     return out, problems
 
 
-def attach_foreground(cmd, cwd):
-    """Run `claude attach` as the terminal's foreground job in its own process group.
-
-    Ctrl+Z is how you leave an attached session, but it stops the whole foreground job —
-    which would freeze basecamp-tui too. In its own group only the viewer stops; we then close
-    the viewer (the session itself keeps running) and take the terminal back.
-    """
-    fd = sys.stdin.fileno()
-    old_ttou = signal.signal(signal.SIGTTOU, signal.SIG_IGN)
-    proc = subprocess.Popen(cmd, cwd=cwd, process_group=0)
-    try:
-        try:
-            os.tcsetpgrp(fd, proc.pid)
-        except OSError:
-            pass  # not a tty (tests); nothing to hand over
-        while True:
-            _, status = os.waitpid(proc.pid, os.WUNTRACED)
-            if not os.WIFSTOPPED(status):
-                break
-            if os.WSTOPSIG(status) in (signal.SIGTTIN, signal.SIGTTOU):
-                os.killpg(proc.pid, signal.SIGCONT)  # read the tty before it was handed over
-                continue
-            os.killpg(proc.pid, signal.SIGTERM)  # Ctrl+Z: close the viewer
-            os.killpg(proc.pid, signal.SIGCONT)
-            os.waitpid(proc.pid, 0)
-            break
-    finally:
-        try:
-            os.tcsetpgrp(fd, os.getpgrp())
-        except OSError:
-            pass
-        signal.signal(signal.SIGTTOU, old_ttou)
+def start_session(name, prompt):
+    """Start a background Claude Code session; it shows up in `claude agents`."""
+    proc = subprocess.run([CLAUDE, "--bg", "--name", name, prompt], cwd=SESSION_DIR,
+                          stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                          start_new_session=True)  # keep it off our terminal entirely
+    m = re.search(r"backgrounded · (\w+)", proc.stdout)
+    if proc.returncode or not m:
+        out = (proc.stdout + proc.stderr).strip()
+        raise RuntimeError(out.splitlines()[0] if out else f"exit {proc.returncode}")
+    return m.group(1)
 
 
 _TITLE_NOISE = [
@@ -643,6 +620,8 @@ class App:
                     self.flash(f"{desc} · u to undo" if entry["revert"] else desc)
             elif tag == "revert":
                 self.flash(f"revert failed: {err}" if err else "reverted ✓")
+            elif tag == "session":
+                self.flash(f"claude failed: {err}" if err else f"session created · {args[0]}")
             elif tag == "reply":
                 self.flash(f"reply failed: {err}" if err else "reply sent ✓")
                 if not err:
@@ -908,33 +887,9 @@ class App:
         message = (self.prompt_line("claude› ") or "").strip()
         if not message:
             return
-        self.flash("creating session…")
-        self.draw()
-        self.scr.refresh()
-        try:
-            sid = self._start_session(n, f"{message}\n\n{n['app_url']}", message)
-        except RuntimeError as e:
-            self.flash(f"claude failed: {e}")
-            return
-        curses.def_prog_mode()
-        curses.endwin()
-        try:
-            attach_foreground([CLAUDE, "attach", sid], SESSION_DIR)
-        finally:
-            curses.reset_prog_mode()
-            self.scr.clear()
-            self.scr.refresh()
-        self.flash(f"back from session {sid} · still running (claude attach {sid})")
-
-    def _start_session(self, n, prompt, message):
         name = session_title(n, self.cache.get(n["id"]), message)
-        proc = subprocess.run([CLAUDE, "--bg", "--name", name, prompt], cwd=SESSION_DIR,
-                              stdin=subprocess.DEVNULL, capture_output=True, text=True)
-        m = re.search(r"backgrounded · (\w+)", proc.stdout)
-        if proc.returncode or not m:
-            out = (proc.stdout + proc.stderr).strip()
-            raise RuntimeError(out.splitlines()[0] if out else f"exit {proc.returncode}")
-        return m.group(1)
+        self.flash("creating session…")
+        self.bg(start_session, name, f"{message}\n\n{n['app_url']}", tag="session")
 
     def confirm(self, prompt):
         h, w = self.scr.getmaxyx()
