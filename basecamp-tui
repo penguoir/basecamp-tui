@@ -904,22 +904,37 @@ class App:
         return ch in ("y", "Y")
 
     def prompt_line(self, lead):
-        """Minimal line editor on the bottom row (for /, : and the Claude prompt)."""
-        h, w = self.scr.getmaxyx()
+        """Line editor at the bottom (for /, : and the Claude prompt).
+
+        Long input wraps and the box grows upwards. Pastes keep their newlines (bracketed
+        paste) and M-⏎ inserts one; ⏎ submits, Esc cancels.
+        """
         buf = ""
+        pasting = False
         self.scr.timeout(-1)
         curses.curs_set(1)
+        sys.stdout.write("\033[?2004h")  # bracketed paste on
+        sys.stdout.flush()
         try:
             while True:
-                self.put(h - 1, 0, clip(lead + buf, w - 1)[0].ljust(w - 1))
-                self.scr.move(h - 1, min(swidth(lead + buf), w - 2))
-                self.scr.refresh()
+                self.draw_prompt(lead, buf)
                 ch = self.scr.get_wch()
-                if ch in ("\n", "\r", curses.KEY_ENTER):
-                    return buf
                 if ch == "\x1b":
-                    return None
-                if ch in (curses.KEY_BACKSPACE, "\x7f", "\b"):
+                    seq = self.read_escape()
+                    if seq == "[200~":
+                        pasting = True
+                    elif seq == "[201~":
+                        pasting = False
+                    elif seq in ("\r", "\n"):  # M-⏎
+                        buf += "\n"
+                    elif not seq and not pasting:
+                        return None
+                    continue
+                if ch in ("\n", "\r", curses.KEY_ENTER):
+                    if not pasting:
+                        return buf
+                    buf += "\n"
+                elif ch in (curses.KEY_BACKSPACE, "\x7f", "\b"):
                     if not buf:
                         return None
                     buf = buf[:-1]
@@ -927,11 +942,55 @@ class App:
                     buf = ""
                 elif ch == "\x17":  # C-w
                     buf = re.sub(r"\S*\s*$", "", buf)
+                elif ch == "\t" and pasting:
+                    buf += "    "
                 elif isinstance(ch, str) and ch.isprintable():
                     buf += ch
         finally:
+            sys.stdout.write("\033[?2004l")
+            sys.stdout.flush()
             curses.curs_set(0)
             self.scr.timeout(100)
+
+    def draw_prompt(self, lead, buf):
+        H, W = self.scr.getmaxyx()
+        width = max(W - 1, 10)
+        rows = []
+        for i, part in enumerate((lead + buf).split("\n")):
+            part = part if i == 0 else "  " + part  # indent continuation lines under the lead
+            wrapped = wrap(part, width) or [""]
+            if part.endswith(" ") and swidth(wrapped[-1]) < width:
+                wrapped[-1] += " "  # wrap() trims; keep the cursor after a typed space
+            rows.extend(wrapped)
+        if swidth(rows[-1]) >= width:  # cursor would sit past the edge
+            rows.append("")
+        rows = rows[-(H - 2):]
+        self.draw()
+        top = H - len(rows)
+        for k, row in enumerate(rows):
+            self.put(top + k, 0, row.ljust(width))
+        if len(rows) > 1:
+            self.put(top - 1, 0, "─" * width, self.c["dim"])
+        self.scr.move(H - 1, min(swidth(rows[-1]), width))
+        self.scr.refresh()
+
+    def read_escape(self):
+        """Rest of an escape sequence ("" for a lone Esc)."""
+        self.scr.timeout(30)
+        seq = ""
+        try:
+            while True:
+                try:
+                    c = self.scr.get_wch()
+                except curses.error:
+                    return seq
+                if not isinstance(c, str):
+                    return seq
+                seq += c
+                if seq in ("\r", "\n") or (len(seq) > 1 and (c.isalpha() or c == "~")):
+                    return seq
+        finally:
+            self.scr.timeout(-1)
 
     # -- keys
 

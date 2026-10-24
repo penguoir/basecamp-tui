@@ -42,7 +42,7 @@ Press `?` inside for this list.
 | | `X` | archive: archive the todo, or move the card to Not now (asks y/n) |
 | | `u` | undo the last mark-read, done or archive |
 | | `r` | reply in vim: opens in insert mode, `:wq` sends, `:q!` drops it. On a check-in reminder it posts your answer. |
-| | `c` / `C` | type a message and press Enter: starts a background Claude Code session with it and the item's URL. You stay in the inbox; pick the session up in `claude agents`. |
+| | `c` / `C` | type a message (it wraps; pastes keep their newlines, Alt+Enter adds one) and press Enter: starts a background Claude Code session with it and the item's URL. You stay in the inbox; pick the session up in `claude agents`. |
 | | `o` / `y` | open in browser / copy the link (OSC 52, works over SSH) |
 | **View** | Tab | unread only / everything |
 | | `/` `n` `N` | search, next, previous |
