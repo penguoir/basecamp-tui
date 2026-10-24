@@ -1,0 +1,22 @@
+basecamp-tui
+  s_00f39a9a4dea63::t_9936599addd824 8,44-45,52,136,293-341,547,574,629-634,686-695,756-760,764-768,770-772,796-797,806-808,894-896,969-978,991-992,1203-1204,1206,1347
+  s_00f39a9a4dea63::t_5c7e069f70d7ca 137
+README.md
+  s_00f39a9a4dea63::t_c6f33707b50ff1 41-42,49,58-64
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "7802aea7ddc2c237a756c28c0600a00f34a477b7",
+  "prompts": {},
+  "sessions": {
+    "s_00f39a9a4dea63": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7d91663e-6e62-4274-a86f-e530018397a7",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Ori Marash <18555359+penguoir@users.noreply.github.com>"
+    }
+  }
+}
