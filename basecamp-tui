@@ -107,8 +107,26 @@ def parse_target(n):
     if not m:
         return None
     frag = re.search(r"(?:#__recording_|@)(\d+)", url)
-    return {"bucket": m.group(1), "kind": m.group(2), "id": m.group(3),
+    kind, rid = m.group(2), m.group(3)
+    # "Answer to …" notifications link to the question, but the answer is the recording
+    # people mean to comment on; its id is in readable_identifier (base64 gid://bc3/Recording/N)
+    if kind == "questions":
+        answer = readable_recording_id(n)
+        if answer and answer != rid:
+            kind, rid = "question_answers", answer
+    return {"bucket": m.group(1), "kind": kind, "id": rid,
             "focus": frag.group(1) if frag else None}
+
+
+def readable_recording_id(n):
+    import base64
+    ident = n.get("readable_identifier") or ""
+    try:
+        gid = base64.urlsafe_b64decode(ident + "=" * (-len(ident) % 4)).decode()
+    except (ValueError, UnicodeDecodeError):
+        return None
+    m = re.fullmatch(r"gid://bc3/Recording/(\d+)", gid)
+    return m.group(1) if m else None
 
 
 _projects = {}
