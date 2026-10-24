@@ -5,6 +5,7 @@ Stdlib only. Talks to Basecamp through the `basecamp` CLI, so it reuses
 whatever account/auth that CLI is logged into. Press ? inside for keys.
 """
 import curses
+import hashlib
 import html
 import html.parser
 import json
@@ -40,14 +41,15 @@ HELP = """\
              J / K     next/prev item (works from the thread too)
  TRIAGE      e or dd   mark read (+advance); count/visual-range aware
              V         visual line mode (then e/d marks the range)
-             D         done: complete the todo / move the card to its Done column
+             n         new note in vim: saved to Basecamp "My notes", listed at the end of the inbox
+             D         done: complete the todo / move the card to its Done column / clear the note
              X         archive: archive the todo / move the card to Not now (asks y/n)
              u         undo last mark-read, done or archive
              r         reply in vim (insert mode; :wq sends, :q! cancels) · answers check-ins
                        @jane / @Jane.Smith become real mentions (C-n completes names)
              o         open in browser       y           yank URL (OSC 52)
              c / C     message a new background Claude session about this item
- VIEW        Tab       toggle unread / all   /  n  N     search, next, prev
+ VIEW        Tab       toggle unread / all   /  N        search (empty / = next), prev
              R         refresh               :q  q       quit
              ?         this help (any key closes)
 """
@@ -131,6 +133,8 @@ def resolve_checkin(n):
 
 def load_thread(n):
     """Return list of (style, text) blocks for the preview pane."""
+    if is_note(n):
+        return [("dim", "My notes · e or D clears it · c asks Claude"), ("body", n["_note"])]
     t = parse_target(n)
     blocks = []
     if t and t["kind"] == "checkin":
@@ -284,6 +288,55 @@ def session_title(n, blocks, message):
     elif len(subject) < 12 and n.get("bucket_name") and t.get("kind") != "chats":
         subject = f"{subject} ({n['bucket_name'].translate(_INVISIBLE).strip()})"  # "Updates" alone says nothing
     return clip(f"{clip(subject, 45)[0]} · {message}", 90)[0]
+
+
+# Notes live in a list of our own inside the Basecamp "My notes" pad; the rest of the pad
+# is never touched. Every change re-reads the pad first so web edits aren't clobbered.
+NOTES_HEADING = "📥 Inbox"
+_NOTES_BLOCK = re.compile(r"<p[^>]*>\s*" + re.escape(NOTES_HEADING) + r"\s*</p>\s*<ul[^>]*>(.*?)</ul>", re.S)
+
+
+def notes_pad():
+    return bc("api", "get", "/my/notes.json") or {}
+
+
+def note_texts(content):
+    m = _NOTES_BLOCK.search(content or "")
+    return [html_to_text(li) for li in re.findall(r"<li[^>]*>(.*?)</li>", m.group(1), re.S)] if m else []
+
+
+def edit_notes(change):
+    """Apply change(list of note texts) -> list of note texts to the pad."""
+    content = notes_pad().get("content") or ""
+    notes = change(note_texts(content))
+    block = ""
+    if notes:
+        items = "".join(f"<li>{html.escape(t).replace(chr(10), '<br>')}</li>" for t in notes)
+        block = f'<p dir="auto">{NOTES_HEADING}</p><ul dir="auto">{items}</ul>'
+    if _NOTES_BLOCK.search(content):
+        content = _NOTES_BLOCK.sub(lambda _: block, content, count=1)
+    else:
+        content += block
+    bc("api", "put", "/my/notes.json", "-d", json.dumps({"content": content}))
+
+
+def remove_note(text):
+    def change(notes):
+        if text in notes:
+            notes.remove(text)
+        return notes
+    edit_notes(change)
+
+
+def note_item(text, url, i=0):
+    """A note dressed up as a notification so it sits in the list like everything else."""
+    return {"id": "note:" + hashlib.sha1(f"{i}:{text}".encode()).hexdigest()[:12], "type": "Note",
+            "bucket_name": "My notes", "title": text.split("\n")[0], "content_excerpt": text,
+            "app_url": url, "read_at": None, "_note": text}
+
+
+def is_note(n):
+    return bool(n) and "_note" in n
 
 
 def item_kind(n):
@@ -491,7 +544,7 @@ def unread(n):
 TYPE_STYLE = {
     "Mention": ("@", "magenta"), "Comment": ("💬", "cyan"), "Chat": ("#", "green"),
     "Message": ("✉", "yellow"), "Reminder": ("⏰", "red"), "Question": ("?", "blue"),
-    "Completion": ("✓", "dim"), "Event": ("·", "dim"),
+    "Completion": ("✓", "dim"), "Event": ("·", "dim"), "Note": ("✎", "green"),
 }
 
 
@@ -518,6 +571,7 @@ class App:
         self.results = queue.Queue()
         self.inflight = set()
         self.help = False
+        self.notes_url = "https://app.basecamp.com/my/navigation/notes"
         self.setup_colors()
         self.refresh()
 
@@ -572,6 +626,12 @@ class App:
             out.extend(fresh)
             if page == 1:
                 self.results.put(("partial", (), list(out), None))
+        try:
+            pad = notes_pad()
+            self.notes_url = pad.get("app_url") or self.notes_url
+            out.extend(note_item(t, self.notes_url, i) for i, t in enumerate(note_texts(pad.get("content"))))
+        except BCError as e:
+            self.results.put(("notes_err", (), None, e))
         return out
 
     def drain(self):
@@ -623,6 +683,16 @@ class App:
                     self.flash(f"{desc} · u to undo" if entry["revert"] else desc)
             elif tag == "revert":
                 self.flash(f"revert failed: {err}" if err else "reverted ✓")
+            elif tag == "note_add":
+                if err:
+                    self.items = [m for m in self.items if m is not args[0]]
+                    self.flash(f"note not saved: {err}")
+            elif tag == "note_done":
+                if err:
+                    args[0]["read_at"] = None
+                    self.flash(f"couldn't clear the note in My notes: {err}")
+            elif tag == "notes_err":
+                self.flash(f"couldn't load My notes: {err}")
             elif tag == "session":
                 self.flash(f"claude failed: {err}" if err else f"session created · {args[0]}")
             elif tag == "reply":
@@ -683,14 +753,23 @@ class App:
         if not batch:
             self.move(hi - self.cur + 1)
             return
-        self.undo.append({"batch": [(self.items.index(n), n) for n in batch], "revert": None, "busy": False})
+        notes = [n for n in batch if is_note(n)]
+        real = [n for n in batch if not is_note(n)]
+        texts = [n["_note"] for n in notes]
+        self.undo.append({"batch": [(self.items.index(n), n) for n in batch], "busy": False,
+                          "revert": (lambda: edit_notes(lambda ns: ns + texts)) if notes else None})
         now = datetime.now(timezone.utc).isoformat()
         for n in batch:
             n["read_at"] = now
-        self.bg(lambda sgids, _batch: mark_read(sgids),
-                [n["readable_sgid"] for n in batch], batch, tag="markread")
+        if real:
+            self.bg(lambda sgids, _batch: mark_read(sgids),
+                    [n["readable_sgid"] for n in real], real, tag="markread")
+        for n in notes:
+            self.bg(lambda note: remove_note(note["_note"]), n, tag="note_done")
         left = sum(1 for n in self.items if unread(n))
-        self.flash(f"marked {len(batch)} read · {left} unread left · u to undo")
+        what = (f"cleared {len(notes)} note{'s' * (len(notes) > 1)}" if not real else
+                f"marked {len(real)} read" + (f" + cleared {len(notes)} note{'s' * (len(notes) > 1)}" if notes else ""))
+        self.flash(f"{what} · {left} left · u to undo")
         if self.show_all:
             self.cur = min(hi + 1, len(v) - 1)
         else:
@@ -714,7 +793,8 @@ class App:
         batch = entry["batch"]
         for _, n in batch:
             n["read_at"] = None
-            self.bg(mark_unread, n, tag="unread")
+            if not is_note(n):
+                self.bg(mark_unread, n, tag="unread")
         if entry["revert"]:
             self.bg(entry["revert"], tag="revert")
         self.cur = self.index_of(batch[0][1]["id"])
@@ -723,6 +803,9 @@ class App:
     def do_item_action(self, action):
         """D / X: finish or archive the todo/card behind the selected notification."""
         n = self.selected()
+        if is_note(n):
+            self.do_mark_read()
+            return
         kind = item_kind(n) if n else None
         if not kind:
             self.flash("D/X work on todos and cards only")
@@ -808,6 +891,9 @@ class App:
 
     def reply(self):
         n = self.selected()
+        if is_note(n):
+            self.flash("that's your note · e or D clears it, c asks Claude")
+            return
         t = parse_target(n) if n else None
         if t and t["kind"] == "checkin":
             try:
@@ -880,6 +966,16 @@ class App:
             curses.reset_prog_mode()
             self.scr.refresh()
 
+    def add_note(self):
+        text = self.compose()
+        if not text:
+            self.flash("nothing written, no note added")
+            return
+        n = note_item(text, self.notes_url, len(self.items))
+        self.items.append(n)
+        self.bg(lambda note: edit_notes(lambda ns: ns + [note["_note"]]), n, tag="note_add")
+        self.flash("note added to My notes · it's at the end of the inbox")
+
     def ask_claude(self):
         n = self.selected()
         if not n:
@@ -892,7 +988,8 @@ class App:
             return
         name = session_title(n, self.cache.get(n["id"]), message)
         self.flash("creating session…")
-        self.bg(start_session, name, f"{message}\n\n{n['app_url']}", tag="session")
+        about = f"My note:\n{n['_note']}" if is_note(n) else n["app_url"]
+        self.bg(start_session, name, f"{message}\n\n{about}", tag="session")
 
     def confirm(self, prompt):
         h, w = self.scr.getmaxyx()
@@ -1103,9 +1200,10 @@ class App:
             s = self.prompt_line("/")
             if s:
                 self.search = s
-                self.do_search(1)
+            if s is not None:
+                self.do_search(1)  # an empty / repeats the last search, like vim
         elif ch == "n":
-            self.do_search(1)
+            self.add_note()
         elif ch == "N":
             self.do_search(-1)
         elif ch == ":":
@@ -1246,7 +1344,7 @@ class App:
             mode = "-- VISUAL --  " if self.visual is not None else ""
             keys = ("j/k scroll · J/K next/prev · e read · D done · X archive · r reply · c claude · h back"
                     if self.focus == "preview" else
-                    "j/k move · l open · e read · D done · X archive · c claude · u undo · ? help")
+                    "j/k move · l open · e read · D done · X archive · n note · c claude · u undo · ? help")
             s = f"{mode}{pos}  {self.count}{self.pending}  {keys}"
         self.put(H - 1, 0, clip(s, W - 1)[0].ljust(W - 1), self.c["dim"])
 

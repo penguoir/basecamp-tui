@@ -38,14 +38,15 @@ Press `?` inside for this list.
 | | `J` `K` | next / previous notification, also from inside a thread |
 | **Triage** | `e` or `dd` | mark read and move on (takes a count, or a `V` range) |
 | | `V` | visual line mode |
-| | `D` | done: complete the todo, or move the card to its board's Done column |
+| | `n` | new note to self, in vim: saved to your Basecamp "My notes" and listed at the end of the inbox to deal with later |
+| | `D` | done: complete the todo, move the card to its board's Done column, or clear the note |
 | | `X` | archive: archive the todo, or move the card to Not now (asks y/n) |
 | | `u` | undo the last mark-read, done or archive |
 | | `r` | reply in vim: opens in insert mode, `:wq` sends, `:q!` drops it. On a check-in reminder it posts your answer. |
 | | `c` / `C` | type a message (it wraps; pastes keep their newlines, Alt+Enter adds one) and press Enter: starts a background Claude Code session with it and the item's URL. You stay in the inbox; pick the session up in `claude agents`. |
 | | `o` / `y` | open in browser / copy the link (OSC 52, works over SSH) |
 | **View** | Tab | unread only / everything |
-| | `/` `n` `N` | search, next, previous |
+| | `/` `N` | search (an empty `/` jumps to the next match), previous |
 | | `R`, `:q` / `q` | refresh, quit |
 
 ### @mentions
@@ -53,6 +54,13 @@ Press `?` inside for this list.
 In a reply, `@jane`, `@ja` or `@Jane.Smith` becomes a real Basecamp mention. If a name matches
 nobody or more than one person, nothing is sent: vim reopens with your text and a note
 listing the options. In vim, `C-n` completes names.
+
+### Notes
+
+`n` is a quick GTD-style inbox: jot something down and it waits at the end of the list
+with everything else. Notes are kept in a "📥 Inbox" list inside your Basecamp **My notes**
+pad (the rest of the pad is left alone, and each change re-reads it first), so they're on
+your phone too. Clearing one with `e`/`D` removes it from the pad; `u` brings it back.
 
 ## Configuration
 
