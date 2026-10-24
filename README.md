@@ -59,6 +59,7 @@ listing the options. In vim, `C-n` completes names.
 | Variable | Default | |
 |---|---|---|
 | `BASECAMP_TUI_SESSION_DIR` | current directory | where Claude sessions start. `claude --bg` refuses untrusted directories and `$HOME`, so point this at a trusted workspace. |
+| `BASECAMP_TUI_CLAUDE_FLAGS` | none | extra flags for the background sessions, e.g. `--dangerously-skip-permissions` (the session can then act in Basecamp and on your machine without asking) |
 | `BASECAMP_BIN` | `basecamp` | path to the Basecamp CLI |
 | `CLAUDE_BIN` | `claude` | path to Claude Code |
 | `VISUAL` / `EDITOR` | `vim` | editor for replies (vi, vim and nvim start in insert mode) |

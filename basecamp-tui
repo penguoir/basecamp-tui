@@ -12,6 +12,7 @@ import locale
 import os
 import queue
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -25,6 +26,8 @@ BC = os.environ.get("BASECAMP_BIN", "basecamp")
 CLAUDE = os.environ.get("CLAUDE_BIN", "claude")
 # `claude --bg` refuses untrusted dirs (and $HOME), so point this at a trusted workspace.
 SESSION_DIR = os.path.expanduser(os.environ.get("BASECAMP_TUI_SESSION_DIR", os.getcwd()))
+# extra flags for background sessions, e.g. "--dangerously-skip-permissions"
+CLAUDE_FLAGS = shlex.split(os.environ.get("BASECAMP_TUI_CLAUDE_FLAGS", ""))
 MAX_PAGES = 3  # unreads come back whole on every page; pages only add read history
 PREFETCH = 3
 HELP = """\
@@ -243,7 +246,7 @@ def resolve_mentions(text, raw_tag=False):
 
 def start_session(name, prompt):
     """Start a background Claude Code session; it shows up in `claude agents`."""
-    proc = subprocess.run([CLAUDE, "--bg", "--name", name, prompt], cwd=SESSION_DIR,
+    proc = subprocess.run([CLAUDE, "--bg", *CLAUDE_FLAGS, "--name", name, prompt], cwd=SESSION_DIR,
                           stdin=subprocess.DEVNULL, capture_output=True, text=True,
                           start_new_session=True)  # keep it off our terminal entirely
     m = re.search(r"backgrounded · (\w+)", proc.stdout)
