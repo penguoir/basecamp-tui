@@ -1,0 +1,1237 @@
+#!/usr/bin/env python3
+"""basecamp-tui: triage your Basecamp notifications from the terminal, vim-style.
+
+Stdlib only. Talks to Basecamp through the `basecamp` CLI, so it reuses
+whatever account/auth that CLI is logged into. Press ? inside for keys.
+"""
+import curses
+import html
+import html.parser
+import json
+import locale
+import os
+import queue
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import unicodedata
+from datetime import datetime, timezone
+
+BC = os.environ.get("BASECAMP_BIN", "basecamp")
+CLAUDE = os.environ.get("CLAUDE_BIN", "claude")
+# `claude --bg` refuses untrusted dirs (and $HOME), so point this at a trusted workspace.
+SESSION_DIR = os.path.expanduser(os.environ.get("BASECAMP_TUI_SESSION_DIR", os.getcwd()))
+MAX_PAGES = 3  # unreads come back whole on every page; pages only add read history
+PREFETCH = 3
+HELP = """\
+ basecamp-tui — vim-style Basecamp inbox
+
+ MOVE        j/k ↓/↑   next/prev          gg / G      top / bottom
+             C-d/C-u   half page          C-f/C-b     full page
+             H/M/L     screen top/mid/bot {count}j    e.g. 5j
+ OPEN        l / ⏎     open thread        h / Esc     back to list
+             J / K     next/prev item (works from the thread too)
+ TRIAGE      e or dd   mark read (+advance); count/visual-range aware
+             V         visual line mode (then e/d marks the range)
+             D         done: complete the todo / move the card to its Done column
+             X         archive: archive the todo / move the card to Not now (asks y/n)
+             u         undo last mark-read, done or archive
+             r         reply in vim (insert mode; :wq sends, :q! cancels) · answers check-ins
+                       @jane / @Jane.Smith become real mentions (C-n completes names)
+             o         open in browser       y           yank URL (OSC 52)
+             c / C     message a new Claude session about this item and attach to it
+ VIEW        Tab       toggle unread / all   /  n  N     search, next, prev
+             R         refresh               :q  q       quit
+             ?         this help (any key closes)
+"""
+
+
+# ---------------------------------------------------------------- CLI calls
+
+class BCError(Exception):
+    pass
+
+
+# `basecamp api` succeeds on the server but chokes rendering a 204's empty body.
+EMPTY_BODY = "unexpected end of JSON input"
+
+
+def bc(*args):
+    proc = subprocess.run([BC, *args, "--json"], capture_output=True, text=True)
+    try:
+        out = json.loads(proc.stdout) if proc.stdout.strip() else {}
+    except json.JSONDecodeError:
+        raise BCError((proc.stderr or proc.stdout).strip()[:200])
+    if proc.returncode != 0 or (isinstance(out, dict) and out.get("ok") is False):
+        msg = out.get("error") if isinstance(out, dict) else None
+        if args[0] == "api" and msg and EMPTY_BODY in msg:
+            return None
+        raise BCError(msg or (proc.stderr.strip()[:200]) or f"exit {proc.returncode}")
+    return out.get("data") if isinstance(out, dict) and "data" in out else out
+
+
+def api_path(url):
+    # https://3.basecampapi.com/<account>/my/unreads/X.json -> /my/unreads/X.json
+    return re.sub(r"^https?://[^/]+/\d+", "", url)
+
+
+def fetch_page(page):
+    return bc("notifications", "list", "--page", str(page)) or {}
+
+
+def mark_read(sgids):
+    bc("api", "put", "/my/unreads.json", "-d", json.dumps({"readables": sgids}))
+
+
+def mark_unread(n):
+    bc("api", "post", api_path(n["unread_url"]), "-d", "{}")
+
+
+def parse_target(n):
+    """bucket, kind, recording id, highlighted sub-recording from app_url."""
+    url = n.get("app_url", "")
+    if n.get("_target"):
+        return n["_target"]
+    if re.search(r"/questions/answers/entries/\d+", url):
+        return {"bucket": None, "kind": "checkin", "id": None, "focus": None}
+    m = re.search(r"/buckets/(\d+)/(.+?)/(\d+)(?:[?#@]|$)", url)
+    if not m:
+        return None
+    frag = re.search(r"(?:#__recording_|@)(\d+)", url)
+    return {"bucket": m.group(1), "kind": m.group(2), "id": m.group(3),
+            "focus": frag.group(1) if frag else None}
+
+
+_projects = {}
+
+
+def resolve_checkin(n):
+    """Check-in reminders link to an answer form with no project in the URL; find the
+    question by project name + question text and pin it on the notification."""
+    if not _projects:
+        _projects.update({p["name"]: p["id"] for p in bc("projects", "list", "--all") or []})
+    bucket = _projects.get(n.get("bucket_name"))
+    if not bucket:
+        raise BCError(f"no project named {n.get('bucket_name')!r}")
+    questions = bc("checkins", "questions", "--in", str(bucket)) or []
+    q = next((q for q in questions if q.get("title") == n.get("title")), None) or (questions or [None])[0]
+    if not q:
+        raise BCError("no check-in question found in that project")
+    n["_target"] = {"bucket": str(bucket), "kind": "questions", "id": str(q["id"]),
+                    "focus": None, "checkin": True}
+    return n["_target"]
+
+
+def load_thread(n):
+    """Return list of (style, text) blocks for the preview pane."""
+    t = parse_target(n)
+    blocks = []
+    if t and t["kind"] == "checkin":
+        t = resolve_checkin(n)
+    if not t:
+        return [("dim", n.get("content_excerpt") or "(no preview)")]
+    if t["kind"] == "chats":
+        lines = bc("api", "get", f"/buckets/{t['bucket']}/chats/{t['id']}/lines.json") or []
+        lines = sorted(lines, key=lambda l: l.get("created_at", ""))[-40:]
+        for ln in lines:
+            focus = str(ln.get("id")) == t["focus"]
+            blocks.append(("focus" if focus else "author",
+                           f"{'▶ ' if focus else ''}{who(ln)} · {age(ln.get('created_at'))}"))
+            files = " ".join(f"[📎 {a.get('filename', 'file')}]" for a in ln.get("attachments") or [])
+            blocks.append(("body", "\n".join(x for x in (html_to_text(ln.get("content") or ""), files) if x)))
+        return blocks or [("dim", "(empty chat)")]
+
+    try:
+        rec = bc("show", t["id"], "--in", t["bucket"]) or {}
+    except BCError as e:
+        return [("dim", n.get("content_excerpt") or ""), ("err", f"(could not load: {e})")]
+    title = rec.get("title") or rec.get("subject") or rec.get("name") or n.get("title")
+    blocks.append(("title", title or ""))
+    meta = [rec.get("type"), who(rec), age(rec.get("created_at"))]
+    if rec.get("due_on"):
+        meta.append(f"due {rec['due_on']}")
+    if rec.get("assignees"):
+        meta.append("→ " + ", ".join(a.get("name", "") for a in rec["assignees"]))
+    if rec.get("completed"):
+        meta.append("✓ completed")
+    blocks.append(("dim", " · ".join(x for x in meta if x)))
+    # todos keep their title in `content`; everything else keeps the body there
+    if rec.get("type") == "Todo":
+        body = rec.get("description")
+    else:
+        body = rec.get("content") or rec.get("description")
+    if body and body.strip() != (title or "").strip():
+        blocks.append(("body", html_to_text(body)))
+
+    if rec.get("type") == "Question":
+        try:
+            comments = bc("api", "get", f"/buckets/{t['bucket']}/questions/{t['id']}/answers.json") or []
+        except BCError:
+            comments = []
+        comments = sorted(comments, key=lambda c: c.get("created_at", ""))[-15:] if isinstance(comments, list) else []
+    elif rec.get("comments_count") or rec.get("comments_count") is None and t["focus"]:
+        try:
+            comments = bc("comments", "list", t["id"], "--in", t["bucket"], "--all") or []
+        except BCError:
+            comments = []
+    else:
+        comments = []
+    for c in comments if isinstance(comments, list) else []:
+        if isinstance(c, dict):
+            focus = str(c.get("id")) == t["focus"]
+            blocks.append(("focus" if focus else "author",
+                           f"{'▶ ' if focus else ''}{who(c)} · {age(c.get('created_at'))}"))
+            blocks.append(("body", html_to_text(c.get("content") or "")))
+    return blocks
+
+
+_people = []
+NOTE = "#! basecamp-tui: "  # editor lines starting with this are instructions, never sent
+
+
+def people():
+    if not _people:
+        _people.extend(bc("people", "pingable") or [])
+    return _people
+
+
+def match_person(token):
+    """@jane / @ja / @Jane.Smith -> list of candidate people (best tier only)."""
+    tok = token.lower().replace(".", " ").replace("_", " ").strip()
+    names = [(p, p.get("name", "").lower()) for p in people()]
+    for test in (lambda nm: nm == tok,
+                 lambda nm: nm.split(" ")[0] == tok,
+                 lambda nm: nm.startswith(tok),
+                 lambda nm: any(part.startswith(tok) for part in nm.split(" "))):
+        hits = [p for p, nm in names if test(nm)]
+        if hits:
+            return hits
+    return []
+
+
+def resolve_mentions(text, raw_tag=False):
+    """Turn @names into Basecamp mentions; returns (text, problems).
+
+    The CLI expands [@Name](mention:SGID) for comments and chat, but not for check-in
+    answers, so those get the final <bc-attachment> tag (which its Markdown keeps as-is).
+    """
+    problems = []
+
+    def sub(m):
+        hits = match_person(m.group(1))
+        if len(hits) == 1:
+            p = hits[0]
+            if raw_tag:
+                return (f'<bc-attachment sgid="{html.escape(p["attachable_sgid"])}" '
+                        f'content-type="application/vnd.basecamp.mention">@{html.escape(p["name"])}</bc-attachment>')
+            return f"[@{p['name']}](mention:{p['attachable_sgid']})"
+        if not hits:
+            problems.append(f"@{m.group(1)} matches nobody")
+        else:
+            opts = ", ".join("@" + p["name"].replace(" ", ".") for p in hits[:6])
+            problems.append(f"@{m.group(1)} is ambiguous: {opts}")
+        return m.group(0)
+
+    # not after a word char, so emails stay emails; trailing dots are punctuation
+    out = re.sub(r"(?<!\w)@+([A-Za-z][\w.\-]*[\w-]|[A-Za-z])", sub, text)
+    return out, problems
+
+
+def attach_foreground(cmd, cwd):
+    """Run `claude attach` as the terminal's foreground job in its own process group.
+
+    Ctrl+Z is how you leave an attached session, but it stops the whole foreground job —
+    which would freeze basecamp-tui too. In its own group only the viewer stops; we then close
+    the viewer (the session itself keeps running) and take the terminal back.
+    """
+    fd = sys.stdin.fileno()
+    old_ttou = signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+    proc = subprocess.Popen(cmd, cwd=cwd, process_group=0)
+    try:
+        try:
+            os.tcsetpgrp(fd, proc.pid)
+        except OSError:
+            pass  # not a tty (tests); nothing to hand over
+        while True:
+            _, status = os.waitpid(proc.pid, os.WUNTRACED)
+            if not os.WIFSTOPPED(status):
+                break
+            if os.WSTOPSIG(status) in (signal.SIGTTIN, signal.SIGTTOU):
+                os.killpg(proc.pid, signal.SIGCONT)  # read the tty before it was handed over
+                continue
+            os.killpg(proc.pid, signal.SIGTERM)  # Ctrl+Z: close the viewer
+            os.killpg(proc.pid, signal.SIGCONT)
+            os.waitpid(proc.pid, 0)
+            break
+    finally:
+        try:
+            os.tcsetpgrp(fd, os.getpgrp())
+        except OSError:
+            pass
+        signal.signal(signal.SIGTTOU, old_ttou)
+
+
+def item_kind(n):
+    t = parse_target(n)
+    return {"todos": "todo", "card_tables/cards": "card"}.get(t["kind"]) if t else None
+
+
+COLUMN_TYPE = {"done": "Kanban::DoneColumn", "archive": "Kanban::NotNowColumn"}
+
+
+def resolve_action(n, action):
+    """Look at the item's live state and return (description, do, undo) for done/archive.
+
+    `do`/`undo` are None when the item is already where the action would put it, so we
+    never "undo" into a state the user didn't leave it in.
+    """
+    t = parse_target(n)
+    b, rid = t["bucket"], t["id"]
+    rec = bc("show", rid, "--in", b) or {}
+    title = clip(rec.get("title") or n.get("title", ""), 40)[0]
+    if item_kind(n) == "todo":
+        if action == "done":
+            if rec.get("completed"):
+                return f"already completed: {title}", None, None
+            return (f"completed “{title}”",
+                    lambda: bc("done", rid, "--project", b),
+                    lambda: bc("reopen", rid, "--project", b))
+        if rec.get("status") == "archived":
+            return f"already archived: {title}", None, None
+        return (f"archived “{title}”",
+                lambda: bc("recordings", "archive", rid, "--in", b),
+                lambda: bc("recordings", "restore", rid, "--in", b))
+
+    col = rec.get("parent") or {}
+    board = (bc("api", "get", f"/buckets/{b}/card_tables/columns/{col['id']}.json") or {}).get("parent") or {}
+    lists = (bc("api", "get", f"/buckets/{b}/card_tables/{board['id']}.json") or {}).get("lists") or []
+    target = next((c for c in lists if c.get("type") == COLUMN_TYPE[action]), None)
+    if not target:
+        raise BCError(f"board “{board.get('title')}” has no {'Done' if action == 'done' else 'Not now'} column")
+    if target["id"] == col.get("id"):
+        return f"already in {target['title']}: {title}", None, None
+    move = lambda to: bc("cards", "move", rid, "--to", str(to), "--in", b)  # noqa: E731
+    return (f"moved “{title}” {col.get('title')} → {target['title']}",
+            lambda: move(target["id"]), lambda: move(col["id"]))
+
+
+def who(r):
+    return (r.get("creator") or {}).get("name", "")
+
+
+# ---------------------------------------------------------------- text utils
+
+class _Text(html.parser.HTMLParser):
+    BLOCK = {"p", "div", "br", "h1", "h2", "h3", "h4", "blockquote", "pre", "tr", "ul", "ol"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.out, self.href, self.depth = [], None, 0
+        self.attach = None  # inside <bc-attachment>: None, "mention" or "file"
+        self.mention = []
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        if self.attach:
+            return
+        if tag in self.BLOCK:
+            self.out.append("\n")
+        if tag in ("ul", "ol"):
+            self.depth += 1
+        elif tag == "li":
+            self.out.append("\n" + "  " * max(self.depth - 1, 0) + "• ")
+        elif tag == "a":
+            self.href = a.get("href")
+        elif tag == "bc-attachment":
+            if a.get("content-type") == "application/vnd.basecamp.mention":
+                self.attach, self.mention = "mention", []
+            else:
+                self.attach = "file"
+                self.out.append(f"[📎 {a.get('caption') or a.get('filename') or 'attachment'}]")
+        elif tag == "img":
+            self.out.append("[image]")
+
+    def handle_endtag(self, tag):
+        if tag == "bc-attachment":
+            if self.attach == "mention":
+                self.out.append("@" + " ".join("".join(self.mention).split()))
+            self.attach = None
+            return
+        if self.attach:
+            return
+        if tag in ("ul", "ol"):
+            self.depth -= 1
+        if tag in self.BLOCK:
+            self.out.append("\n")
+        elif tag == "a" and self.href:
+            text = self.out[-1] if self.out else ""
+            if self.href not in text:
+                self.out.append(f" <{self.href}>")
+            self.href = None
+
+    def handle_data(self, d):
+        if self.attach == "mention":
+            self.mention.append(d)
+        elif not self.attach:
+            self.out.append(d)
+
+
+def html_to_text(s):
+    if not s:
+        return ""
+    if "<" not in s:
+        return html.unescape(s).strip()
+    p = _Text()
+    p.feed(s)
+    text = "".join(p.out)
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+try:
+    import ctypes
+    import ctypes.util
+    _wcwidth = ctypes.CDLL(ctypes.util.find_library("c")).wcwidth
+    _wcwidth.argtypes, _wcwidth.restype = [ctypes.c_wchar], ctypes.c_int
+except (OSError, AttributeError):
+    _wcwidth = None
+
+# Terminals and ncurses disagree about these (emoji presentation, ZWJ sequences),
+# which leaves stale cells on screen, so we never draw them.
+_INVISIBLE = dict.fromkeys([0x200D, 0xFE0E, 0xFE0F, 0x200B])
+
+
+def cw(ch):
+    if _wcwidth:
+        return max(_wcwidth(ch), 0)
+    if unicodedata.combining(ch):
+        return 0
+    return 2 if unicodedata.east_asian_width(ch) in "WF" else 1
+
+
+def swidth(s):
+    return sum(cw(c) for c in s.translate(_INVISIBLE))
+
+
+def clip(s, width):
+    out, w = [], 0
+    for ch in s.translate(_INVISIBLE):
+        if ch in "\n\r\t":
+            ch = " "
+        c = cw(ch)
+        if w + c > width:
+            break
+        out.append(ch)
+        w += c
+    return "".join(out), w
+
+
+def wrap(text, width):
+    text = text.translate(_INVISIBLE)
+    lines = []
+    for para in text.split("\n"):
+        if not para:
+            lines.append("")
+            continue
+        cur, w = "", 0
+        for word in re.split(r"(\s+)", para):
+            ww = swidth(word)
+            if w + ww > width and cur:
+                lines.append(cur.rstrip())
+                cur, w = "", 0
+                if word.isspace():
+                    continue
+            while ww > width:  # hard-break very long words / URLs
+                head, hw = clip(word, width)
+                lines.append(head)
+                word = word[len(head):]
+                ww = swidth(word)
+            cur += word
+            w += ww
+        lines.append(cur.rstrip())
+    return lines
+
+
+def age(ts):
+    if not ts:
+        return ""
+    try:
+        t = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        return ""
+    s = (datetime.now(timezone.utc) - t).total_seconds()
+    if s < 3600:
+        return f"{max(int(s // 60), 0)}m"
+    if s < 86400:
+        return f"{int(s // 3600)}h"
+    if s < 86400 * 14:
+        return f"{int(s // 86400)}d"
+    return t.strftime("%d %b")
+
+
+def unread(n):
+    return not n.get("read_at") or n["read_at"].startswith("0001")
+
+
+TYPE_STYLE = {
+    "Mention": ("@", "magenta"), "Comment": ("💬", "cyan"), "Chat": ("#", "green"),
+    "Message": ("✉", "yellow"), "Reminder": ("⏰", "red"), "Question": ("?", "blue"),
+    "Completion": ("✓", "dim"), "Event": ("·", "dim"),
+}
+
+
+# ---------------------------------------------------------------- the app
+
+class App:
+    def __init__(self, scr):
+        self.scr = scr
+        self.items = []          # every notification we know, API order
+        self.show_all = False
+        self.cur = 0
+        self.top = 0
+        self.focus = "list"      # list | preview
+        self.pscroll = 0
+        self.visual = None       # anchor index when in V mode
+        self.count = ""
+        self.pending = ""        # first key of gg / dd
+        self.search = ""
+        self.status = ""
+        self.status_t = 0
+        self.undo = []           # stack of {"batch": [(index, n)], "revert": fn | None, "busy": bool}
+        self.cache = {}          # notification id -> blocks | "loading" | BCError
+        self.loading = True
+        self.results = queue.Queue()
+        self.inflight = set()
+        self.help = False
+        self.setup_colors()
+        self.refresh()
+
+    # -- plumbing
+
+    def setup_colors(self):
+        curses.start_color()
+        try:
+            curses.use_default_colors()
+            bg = -1
+        except curses.error:
+            bg = curses.COLOR_BLACK
+        names = ["red", "green", "yellow", "blue", "magenta", "cyan"]
+        self.c = {}
+        for i, nm in enumerate(names, 1):
+            curses.init_pair(i, getattr(curses, "COLOR_" + nm.upper()), bg)
+            self.c[nm] = curses.color_pair(i)
+        curses.init_pair(7, curses.COLOR_BLACK, curses.COLOR_CYAN)
+        self.c["bar"] = curses.color_pair(7)
+        curses.init_pair(8, curses.COLOR_BLACK, curses.COLOR_YELLOW)
+        self.c["visual"] = curses.color_pair(8)
+        self.c["dim"] = curses.A_DIM
+
+    def bg(self, fn, *args, tag=None):
+        def run():
+            try:
+                self.results.put((tag, args, fn(*args), None))
+            except Exception as e:  # noqa: BLE001 — surface any failure in the status bar
+                self.results.put((tag, args, None, e))
+        threading.Thread(target=run, daemon=True).start()
+
+    def flash(self, msg):
+        self.status, self.status_t = msg, time.time()
+
+    def refresh(self):
+        self.loading = True
+        self.cache.clear()
+        self.bg(self._load_all, tag="loaded")
+
+    def _load_all(self):
+        seen, out = set(), []
+        for page in range(1, MAX_PAGES + 1):
+            data = fetch_page(page)
+            batch = (data.get("unreads") or []) + (data.get("reads") or [])
+            fresh = [n for n in batch if n["id"] not in seen]
+            for n in fresh:  # some links (check-in reminders) point at the API host, not the web app
+                n["app_url"] = re.sub(r"^https://3\.basecampapi\.com/", "https://app.basecamp.com/", n.get("app_url", ""))
+            if not fresh:
+                break
+            for n in fresh:
+                seen.add(n["id"])
+            out.extend(fresh)
+            if page == 1:
+                self.results.put(("partial", (), list(out), None))
+        return out
+
+    def drain(self):
+        while True:
+            try:
+                tag, args, res, err = self.results.get_nowait()
+            except queue.Empty:
+                return
+            if tag in ("partial", "loaded"):
+                if err:
+                    self.flash(f"load failed: {err}")
+                else:
+                    keep = self.view()[self.cur]["id"] if self.view() else None
+                    self.items = res
+                    self.cur = self.index_of(keep) if keep else 0
+                if tag == "loaded":
+                    self.loading = False
+            elif tag == "thread":
+                n = args[0]
+                self.inflight.discard(n["id"])
+                self.cache[n["id"]] = err if err else res
+                if not err and self.focus == "preview" and self.selected() is n:
+                    self.jump_to_focus()
+            elif tag == "markread":
+                if err:
+                    batch = args[1]
+                    for n in batch:
+                        n["read_at"] = None
+                    self.undo = [u for u in self.undo if u["batch"][0][1] is not batch[0]]
+                    self.flash(f"mark read failed, restored: {err}")
+            elif tag == "unread":
+                if err:
+                    self.flash(f"undo failed on server: {err}")
+            elif tag == "item_action":
+                n, _, entry = args
+                entry["busy"] = False
+                if err:
+                    if entry in self.undo:
+                        self.undo.remove(entry)
+                    for _, m in entry["batch"]:
+                        m["read_at"] = None
+                        self.bg(mark_unread, m, tag="unread")
+                    self.flash(f"failed, left as is: {err}")
+                else:
+                    desc, entry["revert"] = res
+                    if not entry["batch"] and not entry["revert"]:
+                        self.undo.remove(entry)
+                    self.cache.pop(n["id"], None)
+                    self.flash(f"{desc} · u to undo" if entry["revert"] else desc)
+            elif tag == "revert":
+                self.flash(f"revert failed: {err}" if err else "reverted ✓")
+            elif tag == "reply":
+                self.flash(f"reply failed: {err}" if err else "reply sent ✓")
+                if not err:
+                    self.cache.pop(args[0]["id"], None)
+
+    # -- data views
+
+    def view(self):
+        items = self.items if self.show_all else [n for n in self.items if unread(n)]
+        return items
+
+    def index_of(self, nid):
+        for i, n in enumerate(self.view()):
+            if n["id"] == nid:
+                return i
+        return min(self.cur, max(len(self.view()) - 1, 0))
+
+    def selected(self):
+        v = self.view()
+        return v[self.cur] if v and 0 <= self.cur < len(v) else None
+
+    def ensure_loaded(self, n):
+        if n and n["id"] not in self.cache and n["id"] not in self.inflight:
+            self.inflight.add(n["id"])
+            self.bg(load_thread, n, tag="thread")
+
+    def prefetch(self):
+        v = self.view()
+        for n in v[self.cur:self.cur + 1 + PREFETCH]:
+            self.ensure_loaded(n)
+
+    # -- actions
+
+    def move(self, delta):
+        v = self.view()
+        if not v:
+            return
+        self.cur = max(0, min(len(v) - 1, self.cur + delta))
+        self.pscroll = 0
+        if self.focus == "preview":
+            self.jump_to_focus()
+
+    def goto(self, i):
+        self.move(i - self.cur)
+
+    def do_mark_read(self, count=1):
+        v = self.view()
+        if not v:
+            return
+        if self.visual is not None:
+            lo, hi = sorted((self.visual, self.cur))
+            self.visual = None
+        else:
+            lo, hi = self.cur, min(self.cur + count - 1, len(v) - 1)
+        batch = [n for n in v[lo:hi + 1] if unread(n)]
+        if not batch:
+            self.move(hi - self.cur + 1)
+            return
+        self.undo.append({"batch": [(self.items.index(n), n) for n in batch], "revert": None, "busy": False})
+        now = datetime.now(timezone.utc).isoformat()
+        for n in batch:
+            n["read_at"] = now
+        self.bg(lambda sgids, _batch: mark_read(sgids),
+                [n["readable_sgid"] for n in batch], batch, tag="markread")
+        left = sum(1 for n in self.items if unread(n))
+        self.flash(f"marked {len(batch)} read · {left} unread left · u to undo")
+        if self.show_all:
+            self.cur = min(hi + 1, len(v) - 1)
+        else:
+            self.cur = min(lo, max(len(self.view()) - 1, 0))
+        self.pscroll = 0
+        if self.focus == "preview":
+            if not self.view():
+                self.focus = "list"
+            else:
+                self.jump_to_focus()
+
+    def do_undo(self):
+        if not self.undo:
+            self.flash("nothing to undo")
+            return
+        entry = self.undo[-1]
+        if entry["busy"]:
+            self.flash("still applying that change, try again in a second")
+            return
+        self.undo.pop()
+        batch = entry["batch"]
+        for _, n in batch:
+            n["read_at"] = None
+            self.bg(mark_unread, n, tag="unread")
+        if entry["revert"]:
+            self.bg(entry["revert"], tag="revert")
+        self.cur = self.index_of(batch[0][1]["id"])
+        self.flash(f"restored {len(batch)} to unread" + (" and reverted the change" if entry["revert"] else ""))
+
+    def do_item_action(self, action):
+        """D / X: finish or archive the todo/card behind the selected notification."""
+        n = self.selected()
+        kind = item_kind(n) if n else None
+        if not kind:
+            self.flash("D/X work on todos and cards only")
+            return
+        what = {("todo", "done"): "Complete todo", ("todo", "archive"): "Archive todo",
+                ("card", "done"): "Move card to Done", ("card", "archive"): "Move card to Not now"}[(kind, action)]
+        if action == "archive" and not self.confirm(f"{what} “{clip(n.get('title', ''), 50)[0]}”?  y/n"):
+            self.flash("left as is")
+            return
+        self.visual = None
+        was_unread = unread(n)
+        if was_unread:
+            self.do_mark_read()
+            entry = self.undo[-1]
+        else:
+            entry = {"batch": [], "revert": None, "busy": False}
+            self.undo.append(entry)
+        entry["busy"] = True
+        self.flash(f"{what.lower()}…")
+        self.bg(self._run_item_action, n, action, entry, tag="item_action")
+
+    @staticmethod
+    def _run_item_action(n, action, entry):
+        desc, do, undo = resolve_action(n, action)
+        if do:
+            do()
+        return desc, undo
+
+    def do_search(self, step=1):
+        if not self.search:
+            return
+        v = self.view()
+        needle = self.search.lower()
+        for k in range(1, len(v) + 1):
+            i = (self.cur + step * k) % len(v)
+            n = v[i]
+            hay = f"{n.get('title', '')} {n.get('bucket_name', '')} {n.get('content_excerpt', '')}".lower()
+            if needle in hay:
+                self.goto(i)
+                return
+        self.flash(f"not found: {self.search}")
+
+    def jump_to_focus(self):
+        """When opening a thread, land on the comment that pinged us (or the end of a chat)."""
+        self.pscroll = 0
+        n = self.selected()
+        blocks = self.cache.get(n["id"]) if n else None
+        if not isinstance(blocks, list):
+            return
+        lines = self.preview_lines(blocks, self.preview_width())
+        for i, (style, _) in enumerate(lines):
+            if style == "focus":
+                self.pscroll = max(i - 1, 0)
+                return
+        t = parse_target(n)
+        if t and t["kind"] == "chats":
+            self.pscroll = max(len(lines) - (self.body_h() - 1), 0)
+
+    def open_browser(self):
+        n = self.selected()
+        if not n:
+            return
+        url = n["app_url"]
+        opener = os.environ.get("BROWSER") or shutil.which("xdg-open") or shutil.which("open")
+        if opener and (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY") or sys.platform == "darwin"):
+            subprocess.Popen([opener, url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.flash("opened in browser")
+        else:
+            self.yank(url)
+
+    def yank(self, url=None):
+        n = self.selected()
+        url = url or (n and n["app_url"])
+        if not url:
+            return
+        import base64
+        seq = f"\033]52;c;{base64.b64encode(url.encode()).decode()}\a"
+        if os.environ.get("TMUX"):
+            seq = f"\033Ptmux;\033{seq}\033\\"
+        sys.stdout.write(seq)
+        sys.stdout.flush()
+        self.flash(f"copied: {url}")
+
+    def reply(self):
+        n = self.selected()
+        t = parse_target(n) if n else None
+        if t and t["kind"] == "checkin":
+            try:
+                t = resolve_checkin(n)
+            except BCError as e:
+                self.flash(f"can't find the check-in question: {e}")
+                return
+        if not t:
+            self.flash("can't reply to this one")
+            return
+        text, notes = "", ()
+        while True:
+            text = self.compose(text, notes)
+            if not text:
+                self.flash("nothing written, reply not sent")
+                return
+            try:
+                resolved, problems = resolve_mentions(text, raw_tag=bool(t.get("checkin")))
+            except BCError as e:
+                self.flash(f"couldn't load people for @mentions, not sent: {e}")
+                return
+            if not problems:
+                text = resolved
+                break
+            notes = [*problems, "fix the @names below and :wq to send, or :q! to drop the reply"]
+        if t.get("checkin"):
+            args = ("checkins", "answer", "create", t["id"], text, "--in", t["bucket"])
+        elif t["kind"] == "chats":
+            args = ("chat", "post", text, "--in", t["bucket"], "--room", t["id"])
+        else:
+            args = ("comment", t["id"], text, "--in", t["bucket"])
+        self.flash("sending…")
+        self.bg(lambda _n, a: bc(*a), n, args, tag="reply")
+
+    def compose(self, initial="", notes=()):
+        """Open the editor (vim starts in insert mode). Returns the text on :wq, None on :q!.
+
+        In vim, C-n completes @names from the people you can ping.
+        """
+        editor = (os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vim").split()
+        is_vim = os.path.basename(editor[0]) in ("vi", "vim", "nvim", "vim.basic", "vim.tiny")
+        dict_path = None
+        if is_vim:
+            try:
+                with tempfile.NamedTemporaryFile("w", suffix=".dict", prefix="basecamp-tui-", delete=False) as d:
+                    for p in people():
+                        d.write("@" + p["name"].replace(" ", ".") + "\n")
+                    dict_path = d.name
+            except BCError:
+                pass
+            editor += ["+startinsert" if not notes else "+normal G$"]
+            if dict_path:
+                editor += ["-c", f"setlocal iskeyword+=64,46 dictionary={dict_path} complete+=k"]
+        with tempfile.NamedTemporaryFile("w+", suffix=".md", prefix="basecamp-tui-", delete=False) as f:
+            f.write("".join(f"{NOTE}{x}\n" for x in notes) + initial)
+            path = f.name
+        before = os.stat(path).st_mtime_ns
+        curses.def_prog_mode()
+        curses.endwin()
+        try:
+            subprocess.call([*editor, path])
+            if os.stat(path).st_mtime_ns == before:
+                return None  # never written: :q!
+            with open(path) as f:
+                return "".join(ln for ln in f if not ln.startswith(NOTE)).strip()
+        finally:
+            for x in (path, dict_path):
+                if x:
+                    os.unlink(x)
+            curses.reset_prog_mode()
+            self.scr.refresh()
+
+    def ask_claude(self):
+        n = self.selected()
+        if not n:
+            return
+        if not shutil.which(CLAUDE):
+            self.flash(f"`{CLAUDE}` not on PATH (set CLAUDE_BIN)")
+            return
+        message = (self.prompt_line("claude› ") or "").strip()
+        if not message:
+            return
+        self.flash("creating session…")
+        self.draw()
+        self.scr.refresh()
+        try:
+            sid = self._start_session(n, f"{message}\n\n{n['app_url']}")
+        except RuntimeError as e:
+            self.flash(f"claude failed: {e}")
+            return
+        curses.def_prog_mode()
+        curses.endwin()
+        try:
+            attach_foreground([CLAUDE, "attach", sid], SESSION_DIR)
+        finally:
+            curses.reset_prog_mode()
+            self.scr.clear()
+            self.scr.refresh()
+        self.flash(f"back from session {sid} · still running (claude attach {sid})")
+
+    @staticmethod
+    def _start_session(n, prompt):
+        name = "bc " + clip(f"{n.get('bucket_name', '')}: {n.get('title', '')}", 60)[0]
+        proc = subprocess.run([CLAUDE, "--bg", "--name", name, prompt], cwd=SESSION_DIR,
+                              stdin=subprocess.DEVNULL, capture_output=True, text=True)
+        m = re.search(r"backgrounded · (\w+)", proc.stdout)
+        if proc.returncode or not m:
+            out = (proc.stdout + proc.stderr).strip()
+            raise RuntimeError(out.splitlines()[0] if out else f"exit {proc.returncode}")
+        return m.group(1)
+
+    def confirm(self, prompt):
+        h, w = self.scr.getmaxyx()
+        self.scr.timeout(-1)
+        self.put(h - 1, 0, clip(prompt, w - 1)[0].ljust(w - 1), self.c["visual"])
+        self.scr.refresh()
+        ch = self.scr.get_wch()
+        self.scr.timeout(100)
+        return ch in ("y", "Y")
+
+    def prompt_line(self, lead):
+        """Minimal line editor on the bottom row (for /, : and the Claude prompt)."""
+        h, w = self.scr.getmaxyx()
+        buf = ""
+        self.scr.timeout(-1)
+        curses.curs_set(1)
+        try:
+            while True:
+                self.put(h - 1, 0, clip(lead + buf, w - 1)[0].ljust(w - 1))
+                self.scr.move(h - 1, min(swidth(lead + buf), w - 2))
+                self.scr.refresh()
+                ch = self.scr.get_wch()
+                if ch in ("\n", "\r", curses.KEY_ENTER):
+                    return buf
+                if ch == "\x1b":
+                    return None
+                if ch in (curses.KEY_BACKSPACE, "\x7f", "\b"):
+                    if not buf:
+                        return None
+                    buf = buf[:-1]
+                elif ch == "\x15":  # C-u
+                    buf = ""
+                elif ch == "\x17":  # C-w
+                    buf = re.sub(r"\S*\s*$", "", buf)
+                elif isinstance(ch, str) and ch.isprintable():
+                    buf += ch
+        finally:
+            curses.curs_set(0)
+            self.scr.timeout(100)
+
+    # -- keys
+
+    def key(self, ch):
+        if self.help:
+            self.help = False
+            return True
+        if isinstance(ch, str) and ch.isdigit() and (self.count or ch != "0"):
+            self.count += ch
+            return True
+        n = int(self.count or 1)
+        had_count = bool(self.count)
+        self.count = ""
+        pend, self.pending = self.pending, ""
+        h = self.body_h()
+        pv = self.focus == "preview"
+
+        if pend == "g":
+            if ch == "g":
+                if pv:
+                    self.pscroll = 0
+                else:
+                    self.goto(n - 1 if had_count else 0)
+            return True
+        if pend == "d":
+            if ch == "d":
+                self.do_mark_read(n)
+            return True
+
+        if ch in ("g", "d"):
+            if ch == "d" and self.visual is not None:
+                self.do_mark_read()
+            else:
+                self.pending = ch
+        elif ch == "q":
+            if pv:
+                self.focus = "list"
+            elif self.visual is not None:
+                self.visual = None
+            else:
+                return False
+        elif ch == "\x1b":
+            self.visual = None
+            self.focus = "list"
+        elif ch == "?":
+            self.help = True
+        elif ch in ("j", curses.KEY_DOWN):
+            if pv:
+                self.pscroll += n
+            else:
+                self.move(n)
+        elif ch in ("k", curses.KEY_UP):
+            if pv:
+                self.pscroll = max(self.pscroll - n, 0)
+            else:
+                self.move(-n)
+        elif ch == "J":
+            self.move(n)
+        elif ch == "K":
+            self.move(-n)
+        elif ch in ("\x04", "\x15", "\x06", "\x02", curses.KEY_NPAGE, curses.KEY_PPAGE, " "):
+            step = h // 2 if ch in ("\x04", "\x15") else h
+            sign = -1 if ch in ("\x15", "\x02", curses.KEY_PPAGE) else 1
+            if pv:
+                self.pscroll = max(self.pscroll + sign * step, 0)
+            else:
+                self.move(sign * step)
+        elif ch == "G":
+            if pv:
+                self.pscroll = 10 ** 6
+            else:
+                self.goto(n - 1 if had_count else len(self.view()) - 1)
+        elif ch in ("H", "M", "L") and not pv:
+            off = {"H": 0, "M": h // 2, "L": h - 1}[ch]
+            self.goto(min(self.top + off, len(self.view()) - 1))
+        elif ch in ("l", "\n", "\r", curses.KEY_ENTER, curses.KEY_RIGHT):
+            if self.selected():
+                self.focus = "preview"
+                self.ensure_loaded(self.selected())
+                self.jump_to_focus()
+        elif ch in ("h", curses.KEY_LEFT, curses.KEY_BACKSPACE, "\x7f"):
+            self.focus = "list"
+        elif ch == "e":
+            self.do_mark_read(n)
+        elif ch == "V" and not pv:
+            self.visual = None if self.visual is not None else self.cur
+        elif ch == "u":
+            self.do_undo()
+        elif ch == "r":
+            self.reply()
+        elif ch == "D":
+            self.do_item_action("done")
+        elif ch == "X":
+            self.do_item_action("archive")
+        elif ch in ("c", "C"):
+            self.ask_claude()
+        elif ch == "o":
+            self.open_browser()
+        elif ch == "y":
+            self.yank()
+        elif ch == "\t":
+            keep = self.selected()
+            self.show_all = not self.show_all
+            self.cur = self.index_of(keep["id"]) if keep else 0
+            self.flash("showing all" if self.show_all else "showing unread")
+        elif ch == "R":
+            self.refresh()
+            self.flash("refreshing…")
+        elif ch == "/":
+            s = self.prompt_line("/")
+            if s:
+                self.search = s
+                self.do_search(1)
+        elif ch == "n":
+            self.do_search(1)
+        elif ch == "N":
+            self.do_search(-1)
+        elif ch == ":":
+            s = (self.prompt_line(":") or "").strip()
+            if s in ("q", "q!", "qa", "wq", "x"):
+                return False
+            if s.isdigit():
+                self.goto(int(s) - 1)
+            elif s in ("e", "e!", "r", "refresh"):
+                self.refresh()
+            elif s:
+                self.flash(f"not a command: {s}")
+        return True
+
+    # -- drawing
+
+    def body_h(self):
+        return max(self.scr.getmaxyx()[0] - 2, 1)
+
+    def split(self):
+        return self.scr.getmaxyx()[1] >= 140
+
+    def preview_width(self):
+        w = self.scr.getmaxyx()[1]
+        return (w - w * 2 // 5 - 3) if self.split() else w - 4
+
+    def preview_lines(self, blocks, width):
+        out = []
+        for style, text in blocks:
+            if style in ("author", "focus") and out:
+                out.append(("", ""))
+            indent = "  " if style == "body" else ""
+            for ln in wrap(text, width - len(indent)):
+                out.append((style, indent + ln))
+            if style == "title":
+                out.append(("", ""))
+        return out
+
+    def put(self, y, x, s, attr=0):
+        try:
+            self.scr.addstr(y, x, s, attr)
+        except curses.error:
+            pass  # writing the bottom-right cell always "fails"; harmless
+
+    def draw(self):
+        self.scr.erase()
+        H, W = self.scr.getmaxyx()
+        v = self.view()
+        self.cur = max(0, min(self.cur, len(v) - 1)) if v else 0
+        h = self.body_h()
+
+        unread_n = sum(1 for n in self.items if unread(n))
+        mode = "ALL" if self.show_all else "UNREAD"
+        hdr = f" Basecamp inbox · {unread_n} unread · {mode}{' · loading…' if self.loading else ''}"
+        self.put(0, 0, clip(hdr, W)[0].ljust(W), self.c["bar"] | curses.A_BOLD)
+
+        if self.help:
+            for i, ln in enumerate(HELP.splitlines()[: H - 2]):
+                self.put(i + 1, 0, clip(ln, W - 1)[0])
+            self.draw_status()
+            return
+
+        full_preview = self.focus == "preview" and not self.split()
+        lw = W * 2 // 5 if self.split() else W
+        if not full_preview:
+            self.draw_list(v, h, lw)
+        if self.split() or full_preview:
+            x = lw + 1 if self.split() else 0
+            if self.split():
+                for y in range(1, H - 1):
+                    self.put(y, lw, "│", self.c["dim"])
+            self.draw_preview(x, W - x, h)
+        self.draw_status()
+
+    def draw_list(self, v, h, w):
+        if self.cur < self.top:
+            self.top = self.cur
+        elif self.cur >= self.top + h:
+            self.top = self.cur - h + 1
+        if not v:
+            msg = "loading…" if self.loading else "Inbox zero 🎉  (Tab shows read items)"
+            self.put(2, 2, msg, self.c["dim"])
+            return
+        vis = sorted((self.visual, self.cur)) if self.visual is not None else None
+        for row, i in enumerate(range(self.top, min(self.top + h, len(v)))):
+            n = v[i]
+            icon, color = TYPE_STYLE.get(n.get("type"), ("·", "dim"))
+            ag = age(n.get("unread_at") if unread(n) else n.get("read_at")) or age(n.get("created_at"))
+            proj = clip(n.get("bucket_name", ""), 18)[0]
+            proj += " " * (18 - swidth(proj))
+            icon_cell = icon + " " * (2 - swidth(icon))
+            left = f" {'●' if unread(n) else ' '} {icon_cell} {proj} "
+            title, _ = clip(n.get("title", ""), max(w - swidth(left) - 6, 0))
+            line = left + title
+            line += " " * max(w - swidth(line) - 5, 0) + f"{ag:>4} "
+            line, _ = clip(line, w)
+            attr = 0 if unread(n) else self.c["dim"]
+            if vis and vis[0] <= i <= vis[1]:
+                attr = self.c["visual"]
+            elif i == self.cur:
+                attr = curses.A_REVERSE | (curses.A_BOLD if self.focus == "list" else 0)
+            y = row + 1
+            self.put(y, 0, line, attr)
+            if not (vis and vis[0] <= i <= vis[1]) and i != self.cur:
+                self.put(y, 3, icon_cell, self.c[color])
+
+    def draw_preview(self, x, w, h):
+        n = self.selected()
+        if not n:
+            return
+        self.ensure_loaded(n)
+        blocks = self.cache.get(n["id"])
+        if isinstance(blocks, Exception):
+            blocks = [("err", f"failed to load: {blocks}"), ("body", n.get("content_excerpt", ""))]
+        elif blocks is None:
+            blocks = [("title", n.get("title", "")), ("dim", "loading…"),
+                      ("body", n.get("content_excerpt", ""))]
+        head = f"{n.get('bucket_name', '')} · {n.get('type', '')}"
+        self.put(1, x + 1, clip(head, w - 2)[0], self.c["cyan"] | curses.A_BOLD)
+        lines = self.preview_lines(blocks, w - 2)
+        self.pscroll = max(0, min(self.pscroll, len(lines) - (h - 1)))
+        styles = {"title": curses.A_BOLD, "author": self.c["yellow"] | curses.A_BOLD,
+                  "focus": self.c["magenta"] | curses.A_BOLD, "dim": self.c["dim"],
+                  "err": self.c["red"], "body": 0, "": 0}
+        for row, (style, text) in enumerate(lines[self.pscroll:self.pscroll + h - 1]):
+            self.put(row + 2, x + 1, clip(text, w - 2)[0], styles.get(style, 0))
+        if len(lines) > h - 1:
+            pct = int(100 * min(self.pscroll + h - 1, len(lines)) / len(lines))
+            self.put(1, x + w - 6, f"{pct:>3}%", self.c["dim"])
+
+    def draw_status(self):
+        H, W = self.scr.getmaxyx()
+        if self.status and time.time() - self.status_t < 4:
+            s = self.status
+        else:
+            v = self.view()
+            pos = f"{self.cur + 1}/{len(v)}" if v else "0/0"
+            mode = "-- VISUAL --  " if self.visual is not None else ""
+            keys = ("j/k scroll · J/K next/prev · e read · D done · X archive · r reply · c claude · h back"
+                    if self.focus == "preview" else
+                    "j/k move · l open · e read · D done · X archive · c claude · u undo · ? help")
+            s = f"{mode}{pos}  {self.count}{self.pending}  {keys}"
+        self.put(H - 1, 0, clip(s, W - 1)[0].ljust(W - 1), self.c["dim"])
+
+    # -- main loop
+
+    def run(self):
+        curses.curs_set(0)
+        self.scr.keypad(True)
+        self.scr.timeout(100)
+        while True:
+            self.drain()
+            self.prefetch()
+            self.draw()
+            self.scr.refresh()
+            try:
+                ch = self.scr.get_wch()
+            except curses.error:
+                continue
+            if ch == curses.KEY_RESIZE:
+                continue
+            if not self.key(ch):
+                return
+
+
+def main():
+    if not shutil.which(BC):
+        sys.exit(f"basecamp-tui: `{BC}` CLI not found on PATH (set BASECAMP_BIN to override)")
+    locale.setlocale(locale.LC_ALL, "")
+    os.environ.setdefault("ESCDELAY", "25")
+    curses.wrapper(lambda scr: App(scr).run())
+
+
+if __name__ == "__main__":
+    main()
