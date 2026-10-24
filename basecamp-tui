@@ -276,6 +276,36 @@ def attach_foreground(cmd, cwd):
         signal.signal(signal.SIGTTOU, old_ttou)
 
 
+_TITLE_NOISE = [
+    r"^@mentioned you(?: in)?\s*:\s*",
+    r"^(?:re|fwd?)\s*:\s*",
+    r"^(?:overdue|due today|due tomorrow|completed|added|answer to)\s*:?\s*",
+    r"^[^:]{0,60}→\s*[^:]{1,60}:\s*",  # card moved "From → To: Card"
+]
+
+
+def session_title(n, blocks, message):
+    """Session names get truncated after a few characters, so lead with the subject:
+    the item's real title (not "@mentioned you in: Re: …"), then the ask."""
+    t = parse_target(n) or {}
+    subject = ""
+    if t.get("kind") == "chats":
+        subject = n.get("bucket_name", "")
+    elif isinstance(blocks, list):
+        subject = next((text for style, text in blocks if style == "title"), "")
+    if not subject:
+        subject = n.get("title", "")
+        for _ in range(3):
+            for pat in _TITLE_NOISE:
+                subject = re.sub(pat, "", subject, flags=re.I)
+    subject = re.sub(r"^[^\w#]+|[\s:“”\"']+$", "", subject.translate(_INVISIBLE))
+    if len(subject) < 4:
+        subject = n.get("bucket_name", "") or subject
+    elif len(subject) < 12 and n.get("bucket_name") and t.get("kind") != "chats":
+        subject = f"{subject} ({n['bucket_name'].translate(_INVISIBLE).strip()})"  # "Updates" alone says nothing
+    return clip(f"{clip(subject, 45)[0]} · {message}", 90)[0]
+
+
 def item_kind(n):
     t = parse_target(n)
     return {"todos": "todo", "card_tables/cards": "card"}.get(t["kind"]) if t else None
@@ -882,7 +912,7 @@ class App:
         self.draw()
         self.scr.refresh()
         try:
-            sid = self._start_session(n, f"{message}\n\n{n['app_url']}")
+            sid = self._start_session(n, f"{message}\n\n{n['app_url']}", message)
         except RuntimeError as e:
             self.flash(f"claude failed: {e}")
             return
@@ -896,9 +926,8 @@ class App:
             self.scr.refresh()
         self.flash(f"back from session {sid} · still running (claude attach {sid})")
 
-    @staticmethod
-    def _start_session(n, prompt):
-        name = "bc " + clip(f"{n.get('bucket_name', '')}: {n.get('title', '')}", 60)[0]
+    def _start_session(self, n, prompt, message):
+        name = session_title(n, self.cache.get(n["id"]), message)
         proc = subprocess.run([CLAUDE, "--bg", "--name", name, prompt], cwd=SESSION_DIR,
                               stdin=subprocess.DEVNULL, capture_output=True, text=True)
         m = re.search(r"backgrounded · (\w+)", proc.stdout)
