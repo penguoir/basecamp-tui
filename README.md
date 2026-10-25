@@ -9,6 +9,7 @@ that CLI is logged into. No tokens to set up.
 - Read every notification's whole thread (comments, chat lines, check-in answers). It
   jumps to the comment that pinged you.
 - Mark read, complete todos, move cards to Done or Not now, with undo.
+- Stays live: anything you read or answer on the web drops out of the list by itself.
 - Reply in vim, with real `@mentions`.
 - Hand anything to a [Claude Code](https://claude.com/claude-code) session with one key.
 
@@ -50,12 +51,28 @@ Press `?` inside for this list.
 | | `o` / `y` | open in browser / copy the link (OSC 52, works over SSH) |
 | **View** | Tab | unread only / everything |
 | | `/` `N` | search (an empty `/` jumps to the next match), previous |
-| | `R`, `C-l` | refresh, redraw the screen |
+| | `R`, `C-l` | refresh everything in the background, redraw the screen (you rarely need `R`: see [Live sync](#live-sync)) |
 | | `:q` / `q` / `ZZ` / `ZQ` | quit |
 
 Ctrl keys also work in terminals that send them as escape sequences (the kitty keyboard
 protocol or xterm's modifyOtherKeys, as in ghostty, kitty, foot, WezTerm and tmux with
 `extended-keys`).
+
+### Live sync
+
+The inbox syncs itself every 30 seconds, and straight away when you switch back to the
+terminal, so whatever you read or answered in another tab has already left the list. New
+notifications come in and the status line says what changed ("2 new · 3 read elsewhere").
+
+It all happens in the background and nothing blanks. Every thread in the list is loaded ahead
+of time, two at a time, so moving around never waits. A thread with new activity keeps showing
+until the fresh copy arrives, then swaps in where you were (if you were at the bottom of a
+chat, you follow the new lines). If the thread you have open gets read elsewhere, it stays
+where it is until you move off it. `R` does the same for every page and every thread. Your own marks and undos still on their way to
+Basecamp are never overwritten by an older snapshot.
+
+Syncing on switch-back needs a terminal that reports focus (most do). In tmux, add
+`set -g focus-events on` to your tmux.conf. Without it, the 30-second timer still runs.
 
 ### @mentions
 
@@ -76,6 +93,7 @@ your phone too. Clearing one with `e`/`D` removes it from the pad; `u` brings it
 |---|---|---|
 | `BASECAMP_TUI_SESSION_DIR` | current directory | where Claude sessions start. `claude --bg` refuses untrusted directories and `$HOME`, so point this at a trusted workspace. |
 | `BASECAMP_TUI_CLAUDE_FLAGS` | none | extra flags for the background sessions, e.g. `--dangerously-skip-permissions` (the session can then act in Basecamp and on your machine without asking) |
+| `BASECAMP_TUI_SYNC` | `30` | seconds between background syncs; `0` turns the timer off (switching back to the terminal still syncs) |
 | `BASECAMP_BIN` | `basecamp` | path to the Basecamp CLI |
 | `CLAUDE_BIN` | `claude` | path to Claude Code |
 | `VISUAL` / `EDITOR` | `vim` | editor for replies (vi, vim and nvim start in insert mode) |

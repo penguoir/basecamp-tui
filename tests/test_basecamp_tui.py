@@ -671,6 +671,380 @@ class TestLoading(Base):
         self.assertIsInstance(got["t2"], ZeroDivisionError)
 
 
+class TestLiveSync(Base):
+    def serve(self, items, notes_content=""):
+        """What the server says now; fresh copies, like a real fetch."""
+        self.fake.routes[("notifications", "list")] = lambda *a: json.loads(json.dumps(
+            {"unreads": [n for n in items if bt.unread(n)], "reads": [n for n in items if not bt.unread(n)]}
+            if a[3] == "1" else {}))
+        self.fake.routes[("api", "get", "/my/notes.json")] = lambda *a: {
+            "content": notes_content, "app_url": "https://app.basecamp.com/1/notes"}
+
+    def sync(self, app):
+        app.sync()
+        app.drain()
+
+    def test_read_on_the_web_drops_out_and_selection_stays(self):
+        app = self.app([notif(1), notif(2), notif(3)])
+        app.cur = 2
+        self.fake.calls.clear()
+        self.serve([notif(1), notif(2, read=True), notif(3)])
+        self.sync(app)
+        self.assertEqual([n["id"] for n in app.view()], [1, 3])
+        self.assertEqual(app.selected()["id"], 3)
+        self.assertEqual(app.status, "1 read elsewhere")
+        self.assertEqual(self.fake.called("notifications", "list", "--page", "2"), [])  # page 1 only
+
+    def test_new_items_and_reunread_items_count_as_new(self):
+        app = self.app([notif(1), notif(2, read=True)])
+        self.serve([notif(5), notif(1), notif(2)])
+        self.sync(app)
+        self.assertEqual([n["id"] for n in app.view()], [5, 1, 2])
+        self.assertEqual(app.status, "2 new")
+
+    def test_items_are_updated_in_place(self):
+        app = self.app([notif(1)])
+        obj = app.items[0]
+        self.serve([notif(1, title="renamed")])
+        self.sync(app)
+        self.assertIs(app.items[0], obj)
+        self.assertEqual(obj["title"], "renamed")
+
+    def test_snapshot_older_than_our_own_change_waits(self):
+        app = self.app([notif(1), notif(2)])
+        app.sync()             # snapshot taken: 1 still unread on the server
+        app.key("e")           # our mark-read is queued behind it
+        app.drain()
+        self.assertEqual([n["id"] for n in app.view()], [2])
+        self.assertLessEqual(app.sync_due, time.time() + 2)  # tries again shortly
+
+    def test_snapshot_while_our_write_is_in_flight_waits(self):
+        app = self.app([notif(1), notif(2)])
+        app.writing = 1
+        self.serve([notif(2)])
+        self.sync(app)
+        self.assertEqual([n["id"] for n in app.view()], [1, 2])
+        app.writing = 0
+        self.sync(app)
+        self.assertEqual([n["id"] for n in app.view()], [2])
+
+    def test_undo_then_sync_keeps_order(self):
+        app = self.app([notif(1), notif(2)])
+        app.key("e")
+        app.drain()
+        self.serve([notif(1, read=True), notif(2)])
+        app.sync()
+        app.key("u")
+        app.drain()
+        self.assertEqual([n["id"] for n in app.view()], [1, 2])
+
+    def test_server_wins_once_our_write_landed_before_the_sync(self):
+        app = self.app([notif(1), notif(2)])
+        app.key("e")
+        app.drain()
+        app.landed = 0
+        self.serve([notif(1), notif(2)])  # e.g. new activity unread it again
+        self.sync(app)
+        self.assertEqual([n["id"] for n in app.view()], [1, 2])
+        self.assertEqual(app.status, "1 new")
+
+    def test_new_activity_reloads_threads_without_blanking_them(self):
+        app = self.app([notif(1, "messages/1", updated_at="a"), notif(2, "messages/2", updated_at="a")], w=160)
+        app.cache.update({1: [("body", "old one")], 2: [("body", "old two")]})
+        self.serve([notif(1, "messages/1", updated_at="b"), notif(2, "messages/2", updated_at="a")])
+        app.sync()
+        app.drain()
+        self.assertEqual(app.stale, {1})
+        self.fake.routes[("show",)] = lambda *a: {"title": f"new {a[1]}"}
+        app.draw()  # the open thread starts reloading as it's drawn
+        self.assertIn("old one", app.scr.text())  # still showing, no "loading…"
+        self.assertNotIn("loading", app.scr.text())
+        app.prefetch()
+        app.drain()
+        self.assertEqual(app.stale, set())
+        self.assertEqual(app.cache[1][0], ("title", "new 1"))
+        self.assertEqual(app.cache[2], [("body", "old two")])
+        self.assertEqual(len(self.fake.called("show")), 1)
+
+    def test_reload_keeps_your_place_or_follows_new_lines(self):
+        lines = lambda k: [{"id": i, "created_at": f"2026-01-01T00:{i:02d}", "creator": {"name": "A"},  # noqa: E731
+                            "content": f"l{i}"} for i in range(k)]
+        self.fake.routes[("api", "get")] = lines(30)
+        app = self.app([notif(1, "chats/5")], h=15, w=80)
+        app.key("l")
+        app.drain()
+        bottom = app.pscroll
+        self.assertGreater(bottom, 0)
+        self.fake.routes[("api", "get")] = lines(35)
+        app.reload(app.selected())
+        app.prefetch()
+        app.drain()
+        app.draw()
+        self.assertGreater(app.pscroll, bottom)  # was at the bottom: follows the new lines
+        self.assertIn("l34", app.scr.text())
+        app.pscroll = 3
+        app.reload(app.selected())
+        app.prefetch()
+        app.drain()
+        self.assertEqual(app.pscroll, 3)  # scrolled up: stays put
+
+    def test_failed_reload_keeps_the_old_thread(self):
+        app = self.app([notif(1, "messages/1")])
+        app.cache[1] = [("body", "old")]
+        app.reload(app.items[0])
+        self.fake.routes[("show",)] = bt.BCError("offline")
+        app.prefetch()
+        app.drain()
+        self.assertEqual(app.cache[1], [("body", "old")])
+        self.assertEqual(app.stale, set())
+        app.reload(app.items[0])
+        app.thread_loaded(app.items[0], None, bt.BCError("offline"))  # a chat that failed outright
+        self.assertEqual(app.cache[1], [("body", "old")])
+
+    def test_whole_list_is_loaded_in_the_background_a_couple_at_a_time(self):
+        self.fake.routes[("show",)] = {"title": "x"}
+        app = self.app([notif(i, f"messages/{i}") for i in range(1, 11)])
+        app.prefetch()
+        self.assertEqual(len(app.inflight), 1 + bt.PREFETCH)  # what you're near always goes first
+        for _ in range(10):
+            app.drain()
+            app.prefetch()
+            self.assertLessEqual(len(app.inflight), max(bt.WARM, 1 + bt.PREFETCH))
+        app.drain()
+        self.assertEqual(set(app.cache), set(range(1, 11)))
+        self.assertEqual(len(self.fake.called("show")), 10)
+
+    def test_no_background_loading_during_the_first_load(self):
+        app = self.app([notif(i, f"messages/{i}") for i in range(1, 11)])
+        app.loading = True
+        app.cur = 0
+        app.prefetch()
+        self.assertEqual(len(app.inflight), 1 + bt.PREFETCH)
+
+    def test_R_refreshes_everything_quietly(self):
+        app = self.app([notif(1, "messages/1"), notif(2, "messages/2")])
+        app.cache.update({1: [("body", "a")], 2: [("body", "b")]})
+        self.fake.calls.clear()
+        app.key("R")
+        self.assertFalse(app.loading)
+        self.assertEqual(app.stale, {1, 2})
+        app.drain()
+        self.assertEqual([c[3] for c in self.fake.called("notifications", "list")], ["1", "2"])
+        self.assertEqual(app.status, "up to date ✓")
+        self.assertEqual(app.cache[1], [("body", "a")])  # until the reload lands
+
+    def test_R_while_a_sync_is_running_goes_next(self):
+        app = self.app([notif(1)])
+        app.syncing = True
+        app.key("R")
+        self.assertTrue(app.want_full)
+        self.assertLessEqual(app.sync_due, time.time() + 0.5)
+        app.syncing = False
+        self.fake.calls.clear()
+        app.sync()
+        app.drain()
+        self.assertEqual(len(self.fake.called("notifications", "list")), 2)  # pages 1 and 2
+        self.assertFalse(app.want_full)
+
+    def test_R_snapshot_older_than_our_change_retries_in_full(self):
+        app = self.app([notif(1)])
+        app.sync(full=True)
+        app.writing = 1
+        app.drain()
+        self.assertTrue(app.want_full)
+
+    def test_R_failure_and_R_after_a_failed_first_load(self):
+        app = self.app([notif(1)])
+        self.fake.routes[("notifications", "list")] = bt.BCError("offline")
+        app.key("R")
+        app.drain()
+        self.assertEqual(app.status, "refresh failed: offline")
+        app.items = []
+        self.serve([notif(7)])
+        app.key("R")
+        app.drain()
+        self.assertEqual([n["id"] for n in app.items], [7])
+        app.loading = True
+        app.key("R")  # ignored while the first load runs
+        self.assertFalse(app.syncing)
+
+    def test_reply_and_done_reload_the_thread_in_place(self):
+        app = self.app([notif(1, "messages/1")])
+        app.cache[1] = [("body", "a")]
+        app.results.put(("reply", (app.items[0],), None, None))
+        app.drain()
+        self.assertEqual((app.stale, app.cache[1]), ({1}, [("body", "a")]))
+
+    def test_open_item_read_elsewhere_stays_until_you_move(self):
+        self.fake.routes[("show",)] = {"title": "x"}
+        app = self.app([notif(1), notif(2), notif(3)])
+        app.key("j")
+        app.key("l")
+        self.serve([notif(1), notif(2, read=True), notif(3)])
+        self.sync(app)
+        self.assertEqual([n["id"] for n in app.view()], [1, 2, 3])  # stays put on screen
+        self.assertEqual(app.selected()["id"], 2)
+        self.sync(app)  # and through the next sync too
+        self.assertEqual([n["id"] for n in app.view()], [1, 2, 3])
+        app.key("J")
+        self.assertEqual(app.selected()["id"], 3)
+        self.assertEqual([n["id"] for n in app.view()], [1, 3])
+
+    def test_e_on_the_sticky_item_goes_to_the_next_unread(self):
+        app = self.app([notif(1), notif(2), notif(3)])
+        app.focus = "preview"
+        self.serve([notif(1, read=True), notif(2), notif(3)])
+        self.sync(app)
+        app.key("e")
+        self.assertEqual(app.selected()["id"], 2)
+        self.assertEqual(self.fake.called("api", "put"), [])
+        app.cur, app.focus = 0, "preview"
+        self.serve([notif(1, read=True), notif(2, read=True), notif(3)])
+        self.sync(app)
+        app.key("e")  # count/visual marking from the sticky item lands on the next one too
+        self.assertEqual(app.selected()["id"], 3)
+
+    def test_sticky_item_that_was_last_stays_last(self):
+        app = self.app([notif(1), notif(2, read=True)])
+        app.focus = "preview"
+        self.serve([notif(1, read=True), notif(2, read=True)])
+        self.sync(app)
+        self.assertEqual([n["id"] for n in app.view()], [1])
+
+    def test_show_all_has_no_sticky(self):
+        app = self.app([notif(1), notif(2)])
+        app.focus, app.show_all = "preview", True
+        self.serve([notif(1, read=True), notif(2)])
+        self.sync(app)
+        self.assertEqual((app.sticky, app.selected()["id"]), (None, 1))
+
+    def test_list_focus_has_no_sticky(self):
+        app = self.app([notif(1), notif(2)])
+        self.serve([notif(1, read=True), notif(2)])
+        self.sync(app)
+        self.assertEqual(app.selected()["id"], 2)
+
+    def test_history_beyond_page_one_kept_vanished_unreads_dropped(self):
+        app = self.app([notif(1), notif(2), notif(3, read=True)])
+        self.serve([notif(2)])
+        self.sync(app)
+        self.assertEqual([n["id"] for n in app.items], [2, 3])
+        self.assertEqual(app.status, "1 read elsewhere")
+
+    def test_notes_follow_the_pad_unless_we_are_writing(self):
+        pad = "<p>📥 Inbox</p><ul><li>a</li></ul>"
+        app = self.app([notif(1)], notes_content=pad)
+        self.serve([notif(1)], "<p>📥 Inbox</p><ul><li>a</li><li>b from phone</li></ul>")
+        self.sync(app)
+        self.assertEqual([n["_note"] for n in app.view() if bt.is_note(n)], ["a", "b from phone"])
+        self.fake.routes[("api", "get", "/my/notes.json")] = bt.BCError("down")
+        self.sync(app)
+        self.assertEqual(len([n for n in app.view() if bt.is_note(n)]), 2)
+
+    def test_note_writes_are_tracked(self):
+        app = self.app([notif(1)], notes_content="<p>📥 Inbox</p><ul><li>a</li></ul>")
+        app.cur = 1
+        app.key("e")
+        self.assertEqual(app.writing, 1)
+        app.drain()
+        self.assertEqual(app.writing, 0)
+        app.key("u")
+        self.assertEqual(app.writing, 1)
+        app.drain()
+        with mock.patch.object(SyncApp, "compose", return_value="new"):
+            app.key("n")
+        app.drain()
+        self.assertEqual(app.writing, 0)
+        app.cur = 0
+        app.key("e")
+        app.key("u")
+        self.assertEqual(app.writing, 2)
+        app.drain()
+        self.assertEqual(app.writing, 0)
+
+    def test_failed_sync_and_stale_sync_change_nothing(self):
+        app = self.app([notif(1)])
+        self.fake.routes[("notifications", "list")] = bt.BCError("offline")
+        self.sync(app)
+        self.assertEqual((len(app.items), app.syncing), (1, False))
+        self.serve([notif(2)])
+        app.sync()
+        app.refresh()  # a full reload started after the sync took its snapshot
+        app.results.queue.rotate(1)  # the load result arrives first
+        app.drain()
+        self.assertEqual([n["id"] for n in app.items], [2])
+        self.assertFalse(app.syncing)
+
+    def test_no_sync_while_loading_syncing_or_in_visual_mode(self):
+        app = self.app([notif(1)])
+        app.loading = True
+        app.sync()
+        app.loading, app.syncing = False, True
+        app.sync()
+        app.syncing, app.visual = False, 0
+        app.sync()
+        self.assertEqual(app.results.qsize(), 0)
+
+    def test_run_loop_syncs_on_a_timer_and_on_focus(self):
+        app = self.app([notif(1)])
+        calls = lambda: len(self.fake.called("notifications", "list"))  # noqa: E731
+        before = calls()
+        app.sync_due = 0
+        app.scr.keys = [curses.error(), "q"]
+        app.run()
+        self.assertEqual(calls(), before + 1)
+        self.assertIn(bt.FOCUS_REPORTS, self.stdout.out)
+        self.assertIn("\033[?1004l", self.stdout.out)
+        app.scr.keys = ["\x1b", "[", "I", "\x1b", "[", "O", "q"]
+        app.run()
+        self.assertEqual(calls(), before + 2)
+
+    def test_timer_off(self):
+        app = self.app([notif(1)])
+        before = len(self.fake.called("notifications", "list"))
+        app.sync_due = 0
+        app.scr.keys = [curses.error(), "q"]
+        with mock.patch.object(bt, "SYNC_EVERY", 0):
+            app.refresh()
+            app.drain()
+            before = len(self.fake.called("notifications", "list"))
+            app.run()
+            self.assertEqual(len(self.fake.called("notifications", "list")), before)
+            app.sync()
+            self.assertEqual(app.sync_due, float("inf"))
+
+    def test_focus_events_as_terminfo_keys(self):
+        names = {600: b"kxIN", 601: b"kxOUT", 602: b"KEY_DOWN"}
+        with mock.patch.object(bt.curses, "keyname", lambda k: names[k] if k in names else (_ for _ in ()).throw(ValueError)):
+            self.assertEqual(bt.focus_event(600), bt.FOCUS_IN)
+            self.assertEqual(bt.focus_event(601), bt.FOCUS_OUT)
+            self.assertIsNone(bt.focus_event(602))
+            self.assertIsNone(bt.focus_event(-1))
+            app = self.app([notif(1)])
+            app.scr.keys = [600, 601, "q"]
+            before = len(self.fake.called("notifications", "list"))
+            app.run()
+        self.assertEqual(len(self.fake.called("notifications", "list")), before + 1)
+        self.assertIsNone(bt.focus_event("j"))
+        self.assertEqual(bt.decode_escape("[I"), bt.FOCUS_IN)
+        self.assertEqual(bt.decode_escape("[O"), bt.FOCUS_OUT)
+
+    def test_prompts_ignore_focus_reports(self):
+        app = self.app([notif(1, path="todos/5")])
+        app.scr.keys = ["\x1b", "[", "I", "a", "\n"]
+        self.assertEqual(app.prompt_line("/"), "a")
+        app.scr.keys = ["\x1b", "[", "O", "\x1b", "[", "I", "y"]
+        self.assertTrue(app.confirm("sure?"))
+        app.scr.keys = ["\x1b"]
+        self.assertFalse(app.confirm("sure?"))
+
+    def test_editor_turns_focus_reports_back_on(self):
+        app = self.app([])
+        with mock.patch.object(bt.subprocess, "call", return_value=0):
+            app.compose()
+        self.assertIn(bt.FOCUS_REPORTS, self.stdout.out)
+
+
 class TestMarkReadAndUndo(Base):
     def test_e_marks_read_and_u_restores(self):
         app = self.app([notif(1), notif(2), notif(3)])

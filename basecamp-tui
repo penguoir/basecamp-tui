@@ -31,6 +31,8 @@ SESSION_DIR = os.path.expanduser(os.environ.get("BASECAMP_TUI_SESSION_DIR", os.g
 CLAUDE_FLAGS = shlex.split(os.environ.get("BASECAMP_TUI_CLAUDE_FLAGS", ""))
 MAX_PAGES = 3  # unreads come back whole on every page; pages only add read history
 PREFETCH = 3
+WARM = 2  # background thread loads at a time, keeping every thread in the list current
+SYNC_EVERY = float(os.environ.get("BASECAMP_TUI_SYNC", "30"))  # seconds between live syncs; 0 turns them off
 HELP = """\
  basecamp-tui — vim-style Basecamp inbox
 
@@ -54,6 +56,7 @@ HELP = """\
              c / C     message a new background Claude session about this item
  VIEW        Tab       toggle unread / all   /  N        search (empty / = next), prev
              R         refresh               C-l         redraw
+                       (it also syncs quietly every 30s and when you switch back to the terminal)
              :q  q     quit                  ZZ  ZQ      quit
              ?         this help (any key closes)
 """
@@ -89,7 +92,27 @@ def api_path(url):
 
 
 def fetch_page(page):
-    return bc("notifications", "list", "--page", str(page)) or {}
+    data = bc("notifications", "list", "--page", str(page)) or {}
+    for n in (data.get("unreads") or []) + (data.get("reads") or []):
+        # some links (check-in reminders) point at the API host, not the web app
+        n["app_url"] = re.sub(r"^https://3\.basecampapi\.com/", "https://app.basecamp.com/", n.get("app_url", ""))
+    return data
+
+
+def fetch_inbox(pages, first_page=None):
+    seen, out = set(), []
+    for page in range(1, pages + 1):
+        data = fetch_page(page)
+        batch = (data.get("unreads") or []) + (data.get("reads") or [])
+        fresh = [n for n in batch if n["id"] not in seen]
+        if not fresh:
+            break
+        for n in fresh:
+            seen.add(n["id"])
+        out.extend(fresh)
+        if page == 1 and first_page:
+            first_page(list(out))
+    return out
 
 
 def mark_read(sgids):
@@ -576,6 +599,8 @@ def age(ts):
 # foot, WezTerm, tmux with extended-keys) send C-u as ESC[117;5u rather than ^U; read raw,
 # that's Esc, a count of 1175 and u (undo). curses passes on sequences it doesn't know.
 ALT_ENTER = "alt-enter"
+FOCUS_IN, FOCUS_OUT = "focus-in", "focus-out"
+FOCUS_REPORTS = "\033[?1004h"  # the terminal sends ESC[I / ESC[O when its window gains / loses focus
 _CSI_LETTER = {"A": curses.KEY_UP, "B": curses.KEY_DOWN, "C": curses.KEY_RIGHT, "D": curses.KEY_LEFT,
                "H": curses.KEY_HOME, "F": curses.KEY_END}
 _CSI_TILDE = {"1": curses.KEY_HOME, "7": curses.KEY_HOME, "4": curses.KEY_END, "8": curses.KEY_END,
@@ -590,6 +615,8 @@ def decode_escape(seq):
         return "\x1b"
     if seq in ("\r", "\n"):
         return ALT_ENTER
+    if seq in ("[I", "[O"):
+        return FOCUS_IN if seq == "[I" else FOCUS_OUT
     m = re.fullmatch(r"\[(\d+)[:\d]*(?:;(\d+)[:\d]*)?(?:;[\d:]*)?u", seq)  # kitty: CSI code;mods u
     if m:
         code, mods = int(m.group(1)), int(m.group(2) or 1)
@@ -612,6 +639,20 @@ def decode_escape(seq):
         return _CSI_LETTER[m.group(1)]
     m = re.fullmatch(r"\[(\d+)(?:;\d+)?~", seq)
     return _CSI_TILDE.get(m.group(1)) if m else None
+
+
+def focus_event(ch):
+    """FOCUS_IN / FOCUS_OUT if the key is a focus report, else None. ncurses turns ESC[I and
+    ESC[O into keys named kxIN / kxOUT when terminfo knows them (xterm, tmux); elsewhere they
+    arrive as escape sequences that decode_escape names."""
+    if ch in (FOCUS_IN, FOCUS_OUT):
+        return ch
+    if isinstance(ch, int):
+        try:
+            return {b"kxIN": FOCUS_IN, b"kxOUT": FOCUS_OUT}.get(curses.keyname(ch))
+        except (ValueError, curses.error):
+            return None
+    return None
 
 
 def unread(n):
@@ -644,14 +685,21 @@ class App:
         self.status = ""
         self.status_t = 0
         self.undo = []           # stack of {"batch": [(index, n)], "revert": fn | None, "busy": bool}
-        self.cache = {}          # notification id -> blocks | "loading" | BCError
+        self.cache = {}          # notification id -> blocks | BCError
+        self.stale = set()       # ids whose cached thread has new activity; shown until reloaded
         self.loading = True
         self.results = queue.Queue()
         self.inflight = set()
         self.help = False
+        self.sync_due = 0        # when to next sync on our own
+        self.syncing = False
+        self.want_full = False   # an R that has to wait for the sync in flight
+        self.writing = 0         # our read/unread/note writes still on their way
+        self.landed = 0          # when the last of them finished
+        self.sticky = None       # an open item read elsewhere stays listed until you move off it
         self.notes_url = "https://app.basecamp.com/my/navigation/notes"
         self.setup_colors()
-        self.refresh()
+        self.load()
 
     # -- plumbing
 
@@ -684,26 +732,108 @@ class App:
     def flash(self, msg):
         self.status, self.status_t = msg, time.time()
 
-    def refresh(self):
+    def load(self):
+        """The first load, into an empty list."""
         self.loading = True
-        self.cache.clear()
+        self.sync_due = time.time() + SYNC_EVERY if SYNC_EVERY else float("inf")
         self.bg(self._load_all, tag="loaded")
 
+    def refresh(self):
+        """R: re-read every page and every thread in the background; nothing on screen blanks."""
+        if self.loading:
+            return
+        if not self.items:
+            self.load()  # the first load failed
+            return
+        self.stale.update(self.cache)
+        self.sync(full=True)
+
+    def sync(self, full=False):
+        """Quietly pick up what changed elsewhere: read or answered on the web, new activity."""
+        now = time.time()
+        if self.loading or self.syncing or self.visual is not None:
+            if full:
+                self.want_full, self.sync_due = True, min(self.sync_due, now + 0.5)
+            return
+        full, self.want_full = full or self.want_full, False
+        self.syncing, self.sync_due = True, now + SYNC_EVERY if SYNC_EVERY else float("inf")
+        self.bg(self._fetch_sync, now, full, tag="synced")
+
+    @staticmethod
+    def _fetch_sync(_started, full):
+        items = fetch_inbox(MAX_PAGES if full else 1)  # every unread is on page 1; later pages are older reads
+        try:
+            notes = note_texts(notes_pad().get("content"))
+        except BCError:
+            notes = None  # keep the notes we have
+        return items, notes
+
+    def touch(self, n=1):
+        self.writing += n
+
+    def land(self, n=1):
+        self.writing, self.landed = max(self.writing - n, 0), time.time()
+
+    def merge(self, fresh, notes, started, full=False):
+        """Fold a sync into the list. Known items are updated in place, since the undo stack
+        and running threads hold them."""
+        if self.writing or self.landed >= started:
+            self.sync_due = min(self.sync_due, time.time() + 2)  # snapshot predates our own change
+            self.want_full |= full
+            return
+        keep = self.selected()
+        was_unread = bool(keep) and unread(keep)
+        before = [n["id"] for n in self.view()]
+        mine = {n["id"]: n for n in self.items}
+        seen, out, new, gone = set(), [], 0, 0
+        for f in fresh:
+            if f["id"] in seen:
+                continue
+            seen.add(f["id"])
+            n = mine.get(f["id"])
+            if n is None:
+                new += unread(f)
+                out.append(f)
+                continue
+            if unread(n) != unread(f):
+                new, gone = new + unread(f), gone + unread(n)
+            if f.get("updated_at") != n.get("updated_at") and n["id"] in self.cache:
+                self.stale.add(n["id"])  # new activity: reload the thread behind the scenes
+            n.update(f)
+            out.append(n)
+        for n in self.items:
+            if n["id"] in seen or is_note(n):
+                continue
+            if not unread(n):
+                out.append(n)  # read history from the later pages
+            else:
+                gone += 1  # no longer anywhere in the inbox
+        if notes is None:
+            out.extend(n for n in self.items if is_note(n))
+        else:
+            for i, t in enumerate(notes):
+                m = note_item(t, self.notes_url, i)
+                old = mine.get(m["id"])
+                out.append(old if old and unread(old) else m)
+        held = was_unread or self.sticky == (keep or {}).get("id")
+        if any(n is keep for n in out) and held and not unread(keep) and self.focus == "preview" and not self.show_all:
+            # leave it where it is on screen, not down among the reads, until you move on
+            self.sticky = keep["id"]
+            later = before[before.index(keep["id"]) + 1:]
+            out = [n for n in out if n is not keep]
+            ids = {n["id"]: i for i, n in enumerate(out)}
+            nxt = next((ids[k] for k in later if k in ids and unread(out[ids[k]])), len(out))
+            out.insert(nxt, keep)
+        self.items = out
+        if keep is not None:
+            self.cur = self.index_of(keep["id"])
+        if new or gone:
+            self.flash(" · ".join(x for x in (new and f"{new} new", gone and f"{gone} read elsewhere") if x))
+        elif full:
+            self.flash("up to date ✓")
+
     def _load_all(self):
-        seen, out = set(), []
-        for page in range(1, MAX_PAGES + 1):
-            data = fetch_page(page)
-            batch = (data.get("unreads") or []) + (data.get("reads") or [])
-            fresh = [n for n in batch if n["id"] not in seen]
-            for n in fresh:  # some links (check-in reminders) point at the API host, not the web app
-                n["app_url"] = re.sub(r"^https://3\.basecampapi\.com/", "https://app.basecamp.com/", n.get("app_url", ""))
-            if not fresh:
-                break
-            for n in fresh:
-                seen.add(n["id"])
-            out.extend(fresh)
-            if page == 1:
-                self.results.put(("partial", (), list(out), None))
+        out = fetch_inbox(MAX_PAGES, lambda first: self.results.put(("partial", (), first, None)))
         try:
             pad = notes_pad()
             self.notes_url = pad.get("app_url") or self.notes_url
@@ -728,12 +858,17 @@ class App:
                 if tag == "loaded":
                     self.loading = False
             elif tag == "thread":
-                n = args[0]
-                self.inflight.discard(n["id"])
-                self.cache[n["id"]] = err if err else res
-                if not err and self.focus == "preview" and self.selected() is n:
-                    self.jump_to_focus()
+                self.thread_loaded(args[0], res, err)
+            elif tag == "synced":
+                self.syncing = False
+                started, full = args
+                if err:
+                    if full:
+                        self.flash(f"refresh failed: {err}")
+                elif not self.loading:
+                    self.merge(*res, started=started, full=full)
             elif tag == "markread":
+                self.land(len(args[1]))
                 if err:
                     batch = args[1]
                     for n in batch:
@@ -741,6 +876,7 @@ class App:
                     self.undo = [u for u in self.undo if not any(m is batch[0] for _, m in u["batch"])]
                     self.flash(f"mark read failed, restored: {err}")
             elif tag == "unread":
+                self.land()
                 if err:
                     self.flash(f"undo failed on server: {err}")
             elif tag == "item_action":
@@ -751,21 +887,25 @@ class App:
                         self.undo.remove(entry)
                     for _, m in entry["batch"]:
                         m["read_at"] = None
+                        self.touch()
                         self.bg(mark_unread, m, tag="unread")
                     self.flash(f"failed, left as is: {err}")
                 else:
                     desc, entry["revert"] = res
                     if not entry["batch"] and not entry["revert"]:
                         self.undo.remove(entry)
-                    self.cache.pop(n["id"], None)
+                    self.reload(n)
                     self.flash(f"{desc} · u to undo" if entry["revert"] else desc)
             elif tag == "revert":
+                self.land()
                 self.flash(f"revert failed: {err}" if err else "reverted ✓")
             elif tag == "note_add":
+                self.land()
                 if err:
                     self.items = [m for m in self.items if m is not args[0]]
                     self.flash(f"note not saved: {err}")
             elif tag == "note_done":
+                self.land()
                 if err:
                     args[0]["read_at"] = None
                     self.flash(f"couldn't clear the note in My notes: {err}")
@@ -776,13 +916,14 @@ class App:
             elif tag == "reply":
                 self.flash(f"reply failed: {err}" if err else "reply sent ✓")
                 if not err:
-                    self.cache.pop(args[0]["id"], None)
+                    self.reload(args[0])
 
     # -- data views
 
     def view(self):
-        items = self.items if self.show_all else [n for n in self.items if unread(n)]
-        return items
+        if self.show_all:
+            return self.items
+        return [n for n in self.items if unread(n) or n["id"] == self.sticky]
 
     def index_of(self, nid):
         for i, n in enumerate(self.view()):
@@ -795,14 +936,41 @@ class App:
         return v[self.cur] if v and 0 <= self.cur < len(v) else None
 
     def ensure_loaded(self, n):
-        if n and n["id"] not in self.cache and n["id"] not in self.inflight:
+        if n and (n["id"] not in self.cache or n["id"] in self.stale) and n["id"] not in self.inflight:
             self.inflight.add(n["id"])
             self.bg(load_thread, n, tag="thread")
+
+    def reload(self, n):
+        if n["id"] in self.cache:
+            self.stale.add(n["id"])
+
+    def thread_loaded(self, n, blocks, err):
+        """A reload replaces the thread where you are in it (following new lines if you were
+        at the bottom); only a first load jumps to the comment that pinged you."""
+        self.inflight.discard(n["id"])
+        old = self.cache.get(n["id"])
+        reloaded = n["id"] in self.stale and isinstance(old, list)
+        self.stale.discard(n["id"])
+        if reloaded and (err or any(style == "err" for style, _ in blocks)):
+            return  # keep showing what we had
+        on_screen = self.selected() is n and (self.focus == "preview" or self.split())
+        at_end = (reloaded and on_screen and
+                  self.pscroll >= len(self.preview_lines(old, self.preview_width())) - (self.body_h() - 1))
+        self.cache[n["id"]] = err or blocks
+        if at_end:
+            self.pscroll = 10 ** 6  # drawing clamps it to the new end
+        elif not reloaded and not err and self.focus == "preview" and self.selected() is n:
+            self.jump_to_focus()
 
     def prefetch(self):
         v = self.view()
         for n in v[self.cur:self.cur + 1 + PREFETCH]:
             self.ensure_loaded(n)
+        if not self.loading:  # then the rest of the list, a couple at a time
+            for n in v:
+                if len(self.inflight) >= WARM:
+                    break
+                self.ensure_loaded(n)
 
     # -- actions
 
@@ -810,7 +978,9 @@ class App:
         v = self.view()
         if not v:
             return
-        self.cur = max(0, min(len(v) - 1, self.cur + delta))
+        target = v[max(0, min(len(v) - 1, self.cur + delta))]
+        self.sticky = None
+        self.cur = self.index_of(target["id"])
         self.pscroll = 0
         if self.focus == "preview":
             self.jump_to_focus()
@@ -839,6 +1009,7 @@ class App:
         now = datetime.now(timezone.utc).isoformat()
         for n in batch:
             n["read_at"] = now
+        self.touch(len(real) + len(notes))
         if real:
             self.bg(lambda sgids, _batch: mark_read(sgids),
                     [n["readable_sgid"] for n in real], real, tag="markread")
@@ -851,6 +1022,7 @@ class App:
         if self.show_all:
             self.cur = min(hi + 1, len(v) - 1)
         else:
+            self.sticky = None  # it can only be the one under the cursor
             self.cur = min(lo, max(len(self.view()) - 1, 0))
         self.pscroll = 0
         if self.focus == "preview":
@@ -872,8 +1044,10 @@ class App:
         for _, n in batch:
             n["read_at"] = None
             if not is_note(n):
+                self.touch()
                 self.bg(mark_unread, n, tag="unread")
         if entry["revert"]:
+            self.touch()
             self.bg(entry["revert"], tag="revert")
         if batch:
             self.cur = self.index_of(batch[0][1]["id"])
@@ -958,6 +1132,7 @@ class App:
         now = datetime.now(timezone.utc).isoformat()
         for m in same:
             m["read_at"] = now
+        self.touch(len(same))
         self.bg(lambda sgids, _batch: mark_read(sgids), [m["readable_sgid"] for m in same], same, tag="markread")
         self.cur = self.index_of(n["id"])
         self.flash(f"also marked {len(same)} more from {n.get('bucket_name', 'this chat')} read · u to undo")
@@ -1063,6 +1238,8 @@ class App:
                 if x:
                     os.unlink(x)
             curses.reset_prog_mode()
+            sys.stdout.write(FOCUS_REPORTS)  # the editor may have switched them off on exit
+            sys.stdout.flush()
             self.scr.refresh()
 
     def add_note(self):
@@ -1072,6 +1249,7 @@ class App:
             return
         n = note_item(text, self.notes_url, len(self.items))
         self.items.append(n)
+        self.touch()
         self.bg(lambda note: edit_notes(lambda ns: ns + [note["_note"]]), n, tag="note_add")
         self.flash("note added to My notes · it's at the end of the inbox")
 
@@ -1095,7 +1273,12 @@ class App:
         self.scr.timeout(-1)
         self.put(h - 1, 0, clip(prompt, w - 1)[0].ljust(w - 1), self.c["visual"])
         self.scr.refresh()
-        ch = self.scr.get_wch()
+        while True:
+            ch = self.scr.get_wch()
+            if ch == "\x1b":
+                ch = decode_escape(self.read_escape())
+            if not focus_event(ch):
+                break
         self.scr.timeout(100)
         return ch in ("y", "Y")
 
@@ -1128,6 +1311,8 @@ class App:
                         return None
                     if ch is None or ch == "\x1b":
                         continue
+                if focus_event(ch):
+                    continue
                 if ch in ("\n", "\r", curses.KEY_ENTER):
                     if not pasting:
                         return buf
@@ -1315,7 +1500,7 @@ class App:
             self.yank()
         elif ch == "\t":
             keep = self.selected()
-            self.show_all = not self.show_all
+            self.show_all, self.sticky = not self.show_all, None
             self.cur = self.index_of(keep["id"]) if keep else 0
             self.flash("showing all" if self.show_all else "showing unread")
         elif ch == "R":
@@ -1353,7 +1538,7 @@ class App:
 
     def preview_width(self):
         w = self.scr.getmaxyx()[1]
-        return (w - w * 2 // 5 - 3) if self.split() else w - 4
+        return (w - w * 2 // 5 - 3) if self.split() else w - 2
 
     def preview_lines(self, blocks, width):
         out = []
@@ -1479,8 +1664,19 @@ class App:
         curses.curs_set(0)
         self.scr.keypad(True)
         self.scr.timeout(100)
+        sys.stdout.write(FOCUS_REPORTS)  # coming back from the browser syncs straight away
+        sys.stdout.flush()
+        try:
+            self.loop()
+        finally:
+            sys.stdout.write("\033[?1004l")
+            sys.stdout.flush()
+
+    def loop(self):
         while True:
             self.drain()
+            if time.time() >= self.sync_due:
+                self.sync()
             self.prefetch()
             self.draw()
             self.scr.refresh()
@@ -1495,6 +1691,11 @@ class App:
                 self.scr.timeout(100)
                 if ch is None:
                     continue
+            event = focus_event(ch)
+            if event:
+                if event == FOCUS_IN:
+                    self.sync()
+                continue
             if not self.key(ch):
                 return
 
