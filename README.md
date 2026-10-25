@@ -9,6 +9,7 @@ that CLI is logged into. No tokens to set up.
 - Read every notification's whole thread (comments, chat lines, check-in answers). It
   jumps to the comment that pinged you.
 - Mark read, complete todos, move cards to Done or Not now, with undo.
+- A second tab, My tasks: every todo and card assigned to you, soonest due first.
 - Stays live: anything you read or answer on the web drops out of the list by itself.
 - Reply in vim, with real `@mentions`.
 - Hand anything to a [Claude Code](https://claude.com/claude-code) session with one key.
@@ -49,7 +50,8 @@ Press `?` inside for this list.
 | | `r` | reply in vim: opens in insert mode, `:wq` sends, `:q!` drops it. On a check-in reminder it posts your answer. |
 | | `c` / `C` | type a message (it wraps; pastes keep their newlines, Alt+Enter adds one) and press Enter: starts a background Claude Code session with it and the item's URL. You stay in the inbox; pick the session up in `claude agents`. |
 | | `o` / `y` | open in browser / copy the link (OSC 52, works over SSH) |
-| **View** | Tab | unread only / everything |
+| **View** | `t` (or `gt` `gT`, Shift+Tab, `:inbox` `:tasks`) | switch between the Inbox and [My tasks](#my-tasks) |
+| | Tab | unread (open) only / everything |
 | | `/` `N` | search (an empty `/` jumps to the next match), previous |
 | | `R`, `C-l` | refresh everything in the background, redraw the screen (you rarely need `R`: see [Live sync](#live-sync)) |
 | | `:q` / `q` / `ZZ` / `ZQ` | quit |
@@ -57,6 +59,15 @@ Press `?` inside for this list.
 Ctrl keys also work in terminals that send them as escape sequences (the kitty keyboard
 protocol or xterm's modifyOtherKeys, as in ghostty, kitty, foot, WezTerm and tmux with
 `extended-keys`).
+
+### My tasks
+
+`t` switches to every todo and card assigned to you, across all projects, overdue first, then
+by due date, then the undated ones. The right-hand column is the due date (red when overdue)
+rather than an age. Everything else works the same: open the thread, reply, `c` for Claude,
+`o`/`y`, search. There's nothing to mark read here, so `D` (complete the todo, or move the card to
+Done) and `X` (archive the todo) are how things leave the list, with `u` to undo. A card you
+`X` into Not now is still assigned to you, so it stays. The tab syncs along with the inbox.
 
 ### Live sync
 

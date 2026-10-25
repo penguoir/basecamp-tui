@@ -1331,6 +1331,230 @@ class TestItemActions(Base):
         self.assertEqual(app.view(), [])
 
 
+def assignment(aid, kind="todo", due=None, bucket=10, **kw):
+    path = "todos" if kind == "todo" else "card_tables/cards"
+    a = {"id": aid, "type": kind, "content": f"Task {aid}", "due_on": due, "comments_count": 0,
+         "app_url": f"https://app.basecamp.com/1/buckets/{bucket}/{path}/{aid}",
+         "bucket": {"id": bucket, "name": "Proj"}, "parent": {"id": 5, "title": "Backlog"}}
+    a.update(kw)
+    return a
+
+
+def day(offset):
+    return (datetime.now() + timedelta(days=offset)).strftime("%Y-%m-%d")
+
+
+class TestMyTasks(Base):
+    def serve_tasks(self, tasks):
+        self.fake.routes[("assignments", "list")] = lambda *a: {"non_priorities": json.loads(json.dumps(tasks))}
+
+    def tasks_app(self, tasks, items=(), **kw):
+        self.serve_tasks(tasks)
+        self.fake.routes[("show",)] = {"title": "Ship"}
+        return self.app(list(items), **kw)
+
+    def test_task_item_shape(self):
+        n = bt.task_item(assignment(7, "card", due="2026-10-30"))
+        self.assertEqual((n["id"], n["type"], n["title"], n["content_excerpt"]), ("task:7", "Card", "Task 7", "Backlog"))
+        self.assertEqual(bt.item_kind(n), "card")
+        self.assertTrue(bt.unread(n) and bt.is_task(n))
+        self.assertEqual(bt.item_kind(bt.task_item(assignment(8))), "todo")
+
+    def test_due_label(self):
+        self.assertEqual(bt.due_label(day(0)), "today")
+        self.assertEqual(bt.due_label(day(1)), "tmrw")
+        self.assertEqual(bt.due_label(day(-3)), "3d ago")
+        self.assertEqual(bt.due_label(""), "")
+        self.assertEqual(bt.due_label("junk"), "")
+        self.assertEqual(bt.due_label("2099-03-04"), "04 Mar")
+
+    def test_loads_sorted_by_due_and_t_switches_tabs(self):
+        app = self.tasks_app([assignment(1), assignment(2, due=day(5)), assignment(3, "card", due=day(-1))],
+                             items=[notif(10), notif(11)])
+        self.assertFalse(app.tasks_loading)
+        app.key("j")
+        self.assertEqual(app.selected()["id"], 11)
+        app.key("t")
+        self.assertEqual(app.tab, "tasks")
+        self.assertEqual([n["id"] for n in app.view()], ["task:3", "task:2", "task:1"])
+        self.assertEqual(app.cur, 0)
+        app.key("t")
+        self.assertEqual(app.selected()["id"], 11)  # each tab keeps its place
+        app.key("g")
+        app.key("t")
+        self.assertEqual(app.tab, "tasks")
+        app.key(curses.KEY_BTAB)
+        self.assertEqual(app.tab, "inbox")
+        app.scr.keys = list("tasks") + ["\n"]
+        app.key(":")
+        self.assertEqual(app.tab, "tasks")
+        app.switch_tab("tasks")
+        self.assertEqual(app.tab, "tasks")
+
+    def test_switching_resets_preview_and_visual(self):
+        app = self.tasks_app([assignment(1)], items=[notif(10)])
+        app.key("l")
+        app.key("t")
+        self.assertEqual((app.focus, app.visual), ("list", None))
+
+    def test_done_completes_todo_and_undo_brings_it_back(self):
+        app = self.tasks_app([assignment(1), assignment(2)])
+        app.key("t")
+        app.key("D")
+        app.drain()
+        self.assertEqual(self.fake.called("done"), [("done", "1", "--project", "10")])
+        self.assertEqual([n["id"] for n in app.view()], ["task:2"])
+        self.assertIn("completed “Ship”", app.status)
+        self.assertEqual(self.fake.called("api", "put", "/my/unreads.json"), [])  # no notification to mark read
+        app.key("u")
+        app.drain()
+        self.assertEqual(len(self.fake.called("reopen")), 1)
+        self.assertEqual(self.fake.called("api", "post"), [])
+        self.assertEqual([n["id"] for n in app.view()], ["task:1", "task:2"])
+        self.assertEqual(app.writing, 0)
+
+    def test_done_failure_puts_it_back(self):
+        app = self.tasks_app([assignment(1)])
+        self.fake.routes[("show",)] = bt.BCError("forbidden")
+        app.key("t")
+        app.key("D")
+        app.drain()
+        self.assertIn("failed, left as is", app.status)
+        self.assertEqual(len(app.view()), 1)
+        self.assertEqual(self.fake.called("api", "post"), [])
+        self.assertEqual(app.writing, 0)
+
+    def test_archiving_a_card_keeps_it_listed(self):
+        app = self.tasks_app([assignment(1, "card")], keys=["y"])
+        self.fake.routes[("api", "get", "/buckets/10/card_tables/columns/5.json")] = {"parent": {"id": 6}}
+        self.fake.routes[("api", "get", "/buckets/10/card_tables/6.json")] = {
+            "lists": [{"id": 5, "title": "Doing"}, {"id": 9, "title": "Not now", "type": "Kanban::NotNowColumn"}]}
+        self.fake.routes[("show",)] = {"title": "Ship", "parent": {"id": 5, "title": "Doing"}}
+        app.key("t")
+        app.key("X")
+        app.drain()
+        self.assertEqual(self.fake.called("cards", "move"), [("cards", "move", "1", "--to", "9", "--in", "10")])
+        self.assertEqual(len(app.view()), 1)
+
+    def test_e_and_dd_explain_instead_of_marking(self):
+        app = self.tasks_app([assignment(1)])
+        app.key("t")
+        for keys in (["e"], ["d", "d"], ["V", "d"]):
+            app.status = ""
+            for k in keys:
+                app.key(k)
+            self.assertIn("D completes", app.status)
+            self.assertEqual(len(app.view()), 1)
+        self.assertIsNone(app.visual)
+
+    def test_sync_drops_closed_adds_new_and_updates_in_place(self):
+        app = self.tasks_app([assignment(1), assignment(2)], items=[notif(10)])
+        obj = app.lists["tasks"][1]
+        self.serve_tasks([assignment(2, content="renamed"), assignment(3)])
+        app.sync()
+        app.drain()
+        self.assertEqual([n["id"] for n in app.lists["tasks"]], ["task:2", "task:3"])
+        self.assertIs(app.lists["tasks"][0], obj)
+        self.assertEqual(obj["title"], "renamed")
+        self.assertEqual(app.status, "1 new task · 1 closed elsewhere")
+        self.assertEqual(app.tab, "inbox")
+        self.assertEqual(app.selected()["id"], 10)
+
+    def test_sync_keeps_the_open_task_until_you_move(self):
+        app = self.tasks_app([assignment(1), assignment(2)])
+        app.key("t")
+        app.key("l")
+        self.serve_tasks([assignment(2)])
+        app.sync()
+        app.drain()
+        self.assertEqual([n["id"] for n in app.view()], ["task:1", "task:2"])
+        self.assertEqual(app.selected()["id"], "task:1")
+        app.key("J")
+        self.assertEqual([n["id"] for n in app.view()], ["task:2"])
+
+    def test_sync_reloads_a_thread_with_new_comments(self):
+        app = self.tasks_app([assignment(1)])
+        app.cache["task:1"] = [("title", "x")]
+        self.serve_tasks([assignment(1, comments_count=3)])
+        app.sync()
+        app.drain()
+        self.assertIn("task:1", app.stale)
+
+    def test_snapshot_older_than_done_waits(self):
+        app = self.tasks_app([assignment(1)])
+        app.key("t")
+        app.sync()        # snapshot taken: still assigned
+        app.key("D")
+        app.drain()
+        self.assertEqual(app.view(), [])
+
+    def test_failed_task_sync_keeps_tasks(self):
+        app = self.tasks_app([assignment(1)])
+        self.fake.routes[("assignments", "list")] = bt.BCError("offline")
+        app.sync()
+        app.drain()
+        self.assertEqual(len(app.lists["tasks"]), 1)
+
+    def test_load_failure_is_flashed(self):
+        self.fake.routes[("assignments", "list")] = bt.BCError("offline")
+        app = self.app([])
+        self.assertIn("couldn't load your tasks: offline", app.status)
+
+    def test_inbox_sync_while_on_tasks_leaves_tasks_cursor(self):
+        app = self.tasks_app([assignment(1), assignment(2)], items=[notif(10)])
+        app.key("t")
+        app.key("j")
+        self.fake.routes[("notifications", "list")] = lambda *a: {"unreads": [notif(12)]} if a[3] == "1" else {}
+        app.sync()
+        app.drain()
+        self.assertEqual(app.selected()["id"], "task:2")
+        self.assertEqual([n["id"] for n in app.inbox if bt.unread(n)], [12])
+
+    def test_notes_go_to_the_inbox(self):
+        app = self.tasks_app([assignment(1)])
+        app.key("t")
+        with mock.patch.object(app, "compose", return_value="remember"):
+            app.key("n")
+        self.assertEqual(len(app.view()), 1)
+        self.assertTrue(bt.is_note(app.inbox[-1]))
+
+    def test_drawing(self):
+        app = self.tasks_app([assignment(1, due=day(-2)), assignment(2, "card", due=day(0)), assignment(3)],
+                             items=[notif(10)])
+        app.key("t")
+        app.draw()
+        out = app.scr.text()
+        self.assertIn("Basecamp  Inbox 1  My tasks 3  · OPEN", out)
+        self.assertIn("2d ago", out)
+        self.assertIn("today", out)
+        self.assertIn("t inbox", out)
+        self.assertNotIn("e read", out)
+        self.fake.routes[("assignments", "list")] = {}
+        app.lists["tasks"] = []
+        app.draw()
+        self.assertIn("Nothing assigned to you", app.scr.text())
+        app.tasks_loading = True
+        app.draw()
+        self.assertIn("loading…", app.scr.text())
+
+    def test_closed_tasks_show_under_tab(self):
+        app = self.tasks_app([assignment(1)])
+        app.key("t")
+        app.key("D")
+        app.drain()
+        app.key("\t")
+        self.assertIn("showing all", app.status)
+        app.draw()
+        self.assertIn("✓", app.scr.text())
+        app.key("\t")
+        self.assertEqual(app.status, "showing open")
+
+    def test_preview_shows_card_column(self):
+        self.fake.routes[("show",)] = {"title": "Ship", "type": "Kanban::Card", "parent": {"title": "Doing"}}
+        blocks = bt.load_thread(bt.task_item(assignment(1, "card")))
+        self.assertIn("in Doing", blocks[1][1])
+
+
 class TestReply(Base):
     def reply(self, n, text="thanks", routes=None):
         self.fake.routes.update(routes or {})
@@ -1823,7 +2047,7 @@ class TestDrawing(Base):
         app.key("V")
         app.draw()
         out = app.scr.text()
-        self.assertIn("Basecamp inbox · 2 unread · UNREAD", out)
+        self.assertIn("Basecamp  Inbox 2  My tasks 0  · UNREAD", out)
         self.assertIn("Unread thing", out)
         self.assertNotIn("Read thing", out)
         self.assertIn("-- VISUAL --", out)
